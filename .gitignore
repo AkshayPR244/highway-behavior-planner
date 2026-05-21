@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Data / checkpoints
+data/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Logs / outputs
+logs/
+results/*.csv
+results/*.png
+
+# OS
+.DS_Store
