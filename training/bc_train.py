@@ -23,7 +23,6 @@ Usage:
 """
 from __future__ import annotations
 
-import copy
 import random
 from pathlib import Path
 
@@ -32,12 +31,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
+from config.settings import BEHAVIOR_ACTION_NAMES
 from envs.highway_wrapper import make_env
 from policies.idm_expert import collect_expert_rollouts
 from policies.mlp_policy import MLPPolicy
 
 # Action names for readable per-class accuracy output
-ACTION_NAMES = {0: "LANE_LEFT", 1: "IDLE", 2: "LANE_RIGHT", 3: "FASTER", 4: "SLOWER"}
+ACTION_NAMES = {int(k): v for k, v in BEHAVIOR_ACTION_NAMES.items()}
 
 RESULTS_DIR = Path(__file__).parent.parent / "results"
 
@@ -257,7 +257,6 @@ def train_bc(
     # 4. Training loop with early stopping
     # ------------------------------------------------------------------
     best_val_loss = float("inf")
-    best_state    = copy.deepcopy(policy.state_dict())
     patience_ctr  = 0
 
     for epoch in range(1, n_epochs + 1):
@@ -297,7 +296,6 @@ def train_bc(
         # --- Early stopping ---
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_state    = copy.deepcopy(policy.state_dict())
             policy.save(save_path)
             patience_ctr  = 0
             improved_marker = " *"
@@ -319,7 +317,8 @@ def train_bc(
     # ------------------------------------------------------------------
     # 5. Restore best weights and report per-class accuracy
     # ------------------------------------------------------------------
-    policy.load_state_dict(best_state)
+    # Restore the best checkpoint saved during training.
+    policy = MLPPolicy.load(save_path, device=device)
 
     if verbose:
         acc = _class_accuracy(policy, val_loader, dev)

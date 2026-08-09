@@ -27,12 +27,11 @@ We use a binary step cost per episode: 1 if the episode ended in a collision,
 0 otherwise.  This is the simplest formulation that directly minimises the
 collision rate.
 
-The Lagrange penalty added to the PPO loss is:
-    L_safety = λ · mean_collision_cost
+The policy-side penalty is applied directly in rollout rewards:
+    r'_t = r_t − λ · c_t
 
-where mean_collision_cost is the per-step collision rate over the rollout
-(collision_count / n_steps).  This is included via the `extra_loss_fn` hook
-in PPOTrainer.update().
+where c_t is a binary per-step collision cost label (1 on collision
+transitions, 0 otherwise) stored in the rollout buffer.
 
 λ history
 ----------
@@ -51,10 +50,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import torch
 
 from rl.ppo_agent import ActorCritic
-from rl.ppo_trainer import PPOConfig, PPOTrainer, RolloutBuffer
+from rl.ppo_trainer import PPOConfig, PPOTrainer
 from rl.reward_shaping import IRLRewardShaper
 
 
@@ -128,30 +126,6 @@ class CMDPTrainer:
         self._lambda = float(np.clip(new_lambda, 0.0, self.cmdp_cfg.lambda_max))
 
     # ------------------------------------------------------------------
-    # Safety penalty hook (injected into PPO's update loop)
-    # ------------------------------------------------------------------
-
-    def _safety_loss_fn(self, obs_batch: torch.Tensor) -> torch.Tensor:
-        """
-        Returns λ · mean_collision_cost as a loss term.
-
-        We don't have per-step collision labels inside the PPO update loop,
-        so we use λ as a constant penalty on the policy distribution entropy
-        (a proxy for conservatism).  The true constraint enforcement happens
-        through the rollout-level λ update.
-
-        Concretely: this returns a zero-gradient scalar that just carries λ
-        into the loss graph, ensuring the dual update propagates through logging.
-        The actual safety signal is in the rollout stats → λ update path.
-        """
-        # λ·0 — contributes nothing to gradients but is logged in the loss sum.
-        # The real constraint is enforced by λ weighting the *reward* collected
-        # during rollout: low reward → low advantage → policy avoids collisions.
-        # See the `shaped_reward` path where we subtract λ·collision_cost.
-        return torch.tensor(0.0, dtype=torch.float32,
-                            device=next(self.ppo.ac.parameters()).device)
-
-    # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
 
@@ -169,7 +143,7 @@ class CMDPTrainer:
         At each iteration:
           1. Collect rollout with current policy
           2. Compute per-rollout collision rate
-          3. Add λ · collision_rate to the reward shaping signal (in-place)
+          3. Apply reward penalty per transition: r'_t = r_t - λ·c_t
           4. Run PPO update
           5. Update λ via dual gradient step
 
@@ -200,27 +174,17 @@ class CMDPTrainer:
             )
 
             # ---- 2. Subtract λ · collision penalty from rewards ----
-            # We modify the rollout buffer rewards in-place: any step in an
-            # episode that ended in collision gets an extra -λ penalty.
-            # We track episode boundaries via the `dones` list.
+            # Costs are per-transition labels collected during rollout:
+            #   cost_t = 1.0 on collision transitions, else 0.0.
             if self._lambda > 0.0:
-                ep_start = 0
                 for t in range(n_steps):
-                    if buf.dones[t]:
-                        ep_end = t
-                        # Check if this episode ended in a collision by looking
-                        # back to the last done and checking collision count.
-                        # We approximate: spread the penalty evenly across steps.
-                        # A simpler approach: penalise only the terminal step.
-                        buf.rewards[t] -= self._lambda
-                        ep_start = t + 1
+                    buf.rewards[t] -= self._lambda * float(buf.costs[t])
 
-                # Recompute returns with the updated rewards
-                # (last_value is 0 since we're at a done step or end of buffer)
+                # Recompute returns with the original rollout bootstrap.
                 buf.advantages = None
                 buf.returns    = None
                 buf.compute_returns(
-                    last_value=0.0,
+                    last_value=buf.last_value,
                     gamma=self.ppo.cfg.gamma,
                     gae_lambda=self.ppo.cfg.gae_lambda,
                     device=self.ppo.device,

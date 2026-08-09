@@ -42,8 +42,8 @@ Feature index  Name                     Formula
     7  accel            𝟙[a ∈ {FASTER,SLOWER}] — pure accel cost
 
 The 12-feature extension (indices 8–11: lcL×left_gap, lcR×right_gap,
-lcL×left_side, lcR×right_side) is implemented in extract() and
-extract_batch() but NOT active by default because it fails in practice
+lcL×left_side, lcR×right_side) is documented but intentionally disabled in
+the active extraction path because it fails in practice
 with 50 expert episodes (~16 LC steps).  With only 16 LC steps driving
 features 8–11, MaxEnt learns wrong-sign weights (+1.6 instead of -1.6
 on the gap incentives) due to distribution-shift artefacts in the single-
@@ -77,14 +77,7 @@ _LC_ACTIONS    = frozenset({0, 2})   # LANE_LEFT, LANE_RIGHT
 # Actions that involve acceleration/deceleration (jerk proxy)
 _ACCEL_ACTIONS = frozenset({3, 4})   # FASTER, SLOWER
 
-# Lane-identification thresholds (calibrated from y_rel distribution).
-# y_rel is normalised; adjacent lane centres are at ±0.333.  We use
-# ±0.2 as the inner boundary (same-lane vs. adjacent) and ±0.5 as the
-# outer boundary (adjacent vs. two-lanes-away).
 _Y_SAME_THR  = 0.2    # |y_rel| < this → same lane
-_Y_ADJ_THR   = 0.5    # |y_rel| < this → adjacent lane (> → far lane)
-# Longitudinal range that counts as "beside" ego (for side-safety check)
-_X_SIDE_THR  = 0.35   # |x_rel| < this → running alongside
 
 N_FEATURES = 8   # active feature count (see module docstring for 12-feature notes)
 FEATURE_NAMES = [
@@ -140,36 +133,6 @@ def extract(obs: np.ndarray, action: int) -> np.ndarray:
         closeness = max(0.0, 1.0 - min_x)
     else:
         closeness = 0.0
-
-    # Left adjacent lane: -_Y_ADJ_THR < y_rel < -_Y_SAME_THR
-    left_lane  = (npc_y < -_Y_SAME_THR) & (npc_y > -_Y_ADJ_THR)
-    right_lane = (npc_y >  _Y_SAME_THR) & (npc_y <  _Y_ADJ_THR)
-
-    # Gap ahead in left lane: min x_rel of present left-lane vehicles ahead
-    # (higher = more gap = lower cost when multiplied by a negative weight)
-    mask_left_ahead  = present & left_lane  & ahead
-    mask_right_ahead = present & right_lane & ahead
-    left_gap  = float(np.clip(npc_x[mask_left_ahead].min(),  0.0, 1.0)) \
-                if mask_left_ahead.any()  else 1.0
-    right_gap = float(np.clip(npc_x[mask_right_ahead].min(), 0.0, 1.0)) \
-                if mask_right_ahead.any() else 1.0
-
-    # Side closeness in adjacent lanes: closeness of vehicles running
-    # alongside ego (|x_rel| < _X_SIDE_THR) in the adjacent lane.
-    # High value = something is right beside us = dangerous to merge.
-    side_mask = np.abs(npc_x) < _X_SIDE_THR
-    mask_left_side  = present & left_lane  & side_mask
-    mask_right_side = present & right_lane & side_mask
-    if mask_left_side.any():
-        min_side_x_left  = float(np.abs(npc_x[mask_left_side]).min())
-        left_side_close  = max(0.0, 1.0 - min_side_x_left / _X_SIDE_THR)
-    else:
-        left_side_close  = 0.0
-    if mask_right_side.any():
-        min_side_x_right = float(np.abs(npc_x[mask_right_side]).min())
-        right_side_close = max(0.0, 1.0 - min_side_x_right / _X_SIDE_THR)
-    else:
-        right_side_close = 0.0
 
     # ------------------------------------------------------------------ #
     # Action indicators                                                    #
@@ -239,38 +202,6 @@ def extract_batch(
     filled_x_same = np.where(valid_same, npc_x, 2.0)
     min_x_same    = np.clip(filled_x_same.min(axis=1), 0.0, 1.0)
     closeness     = np.maximum(0.0, 1.0 - min_x_same).astype(np.float32)
-
-    # Adjacent-lane masks
-    left_lane  = (npc_y < -_Y_SAME_THR) & (npc_y > -_Y_ADJ_THR)   # (N, 4)
-    right_lane = (npc_y >  _Y_SAME_THR) & (npc_y <  _Y_ADJ_THR)   # (N, 4)
-
-    # Gap ahead in left / right adjacent lane
-    # (min x_rel of present vehicles in that lane that are ahead)
-    # Default to 1.0 (maximum gap = no vehicle = safe) when lane is empty.
-    valid_left_ahead  = npc_present & left_lane  & ahead
-    valid_right_ahead = npc_present & right_lane & ahead
-    filled_x_left  = np.where(valid_left_ahead,  npc_x, 2.0)
-    filled_x_right = np.where(valid_right_ahead, npc_x, 2.0)
-    left_gap  = np.clip(filled_x_left.min(axis=1),  0.0, 1.0).astype(np.float32)
-    right_gap = np.clip(filled_x_right.min(axis=1), 0.0, 1.0).astype(np.float32)
-
-    # Side closeness in adjacent lane (vehicles running alongside: |x_rel| < _X_SIDE_THR)
-    side_zone = np.abs(npc_x) < _X_SIDE_THR
-    valid_left_side  = npc_present & left_lane  & side_zone   # (N, 4)
-    valid_right_side = npc_present & right_lane & side_zone
-    # For each batch item, find min |x_rel| among valid side vehicles.
-    # Default to _X_SIDE_THR (zero closeness) when no vehicle is beside us.
-    abs_x = np.abs(npc_x)
-    filled_side_left  = np.where(valid_left_side,  abs_x, _X_SIDE_THR)
-    filled_side_right = np.where(valid_right_side, abs_x, _X_SIDE_THR)
-    min_side_left  = filled_side_left.min(axis=1)   # (N,)
-    min_side_right = filled_side_right.min(axis=1)
-    left_side_close  = np.maximum(
-        0.0, 1.0 - min_side_left  / _X_SIDE_THR
-    ).astype(np.float32)
-    right_side_close = np.maximum(
-        0.0, 1.0 - min_side_right / _X_SIDE_THR
-    ).astype(np.float32)
 
     # Action indicators
     is_lc_left  = (actions == 0).astype(np.float32)
@@ -348,8 +279,39 @@ def extract_all_actions_batch(obs_batch: np.ndarray) -> np.ndarray:
         phi[i, a] is the feature vector for sample i, action a.
     """
     n = len(obs_batch)
+    mat = obs_batch.reshape(n, _N_VEHICLES, _N_FEATURES)  # (N, 5, 5)
+
+    npc_x       = mat[:, 1:, _IDX_X]                          # (N, 4)
+    npc_y       = mat[:, 1:, _IDX_Y]                          # (N, 4)
+    npc_present = mat[:, 1:, _IDX_PRESENCE] > 0.5             # (N, 4)
+
+    speed = np.clip(mat[:, 0, _IDX_VX], 0.0, 1.0).astype(np.float32)  # (N,)
+
+    same_lane = np.abs(npc_y) < _Y_SAME_THR
+    ahead     = npc_x > 0.0
+    valid_same = npc_present & same_lane & ahead
+    filled_x_same = np.where(valid_same, npc_x, 2.0)
+    min_x_same    = np.clip(filled_x_same.min(axis=1), 0.0, 1.0)
+    closeness     = np.maximum(0.0, 1.0 - min_x_same).astype(np.float32)
+
+    # Layout: actions 0..4 = [LANE_LEFT, IDLE, LANE_RIGHT, FASTER, SLOWER]
     result = np.zeros((n, 5, N_FEATURES), dtype=np.float32)
-    for a in range(5):
-        a_batch = np.full(n, a, dtype=np.int64)
-        result[:, a, :] = extract_batch(obs_batch, a_batch)
+
+    # speed×faster / speed×slower / speed×idle
+    result[:, 3, 0] = speed
+    result[:, 4, 1] = speed
+    result[:, 1, 2] = speed
+
+    # close×slower / close×lc / close×idle
+    result[:, 4, 3] = closeness
+    result[:, 0, 4] = closeness
+    result[:, 2, 4] = closeness
+    result[:, 1, 5] = closeness
+
+    # lane_change and accel indicator features
+    result[:, 0, 6] = 1.0
+    result[:, 2, 6] = 1.0
+    result[:, 3, 7] = 1.0
+    result[:, 4, 7] = 1.0
+
     return result

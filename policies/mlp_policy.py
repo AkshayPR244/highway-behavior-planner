@@ -22,10 +22,10 @@ import torch.nn as nn
 import numpy as np
 from pathlib import Path
 
+from config.settings import N_ACTIONS
 from envs.highway_wrapper import OBS_FEATURES, OBS_VEHICLES
 
 OBS_DIM = OBS_VEHICLES * len(OBS_FEATURES)   # 25
-N_ACTIONS = 5                                # DiscreteMetaAction
 
 
 class MLPPolicy(nn.Module):

@@ -1,0 +1,185 @@
+{
+  "run_dir": "results/retrain_eval/20260809_174519_production_stability",
+  "baseline": {
+    "ppo_unconstrained": {
+      "collision_rate": 0.0,
+      "mean_min_ttc": null,
+      "rms_jerk": 2.1915978997643837,
+      "goal_completion": 1.0,
+      "fallback_rate": 0.0,
+      "lc_frequency": 0.0,
+      "lc_completion_rate": null,
+      "lc_anticipatory_frac": null,
+      "ego_fault_rate": 0.0,
+      "npc_fault_rate": 0.0,
+      "n_episodes": 150,
+      "n_steps_total": 6000,
+      "collision_rate_ci_low": 1.734723475976807e-18,
+      "collision_rate_ci_high": 0.0249702443680766
+    },
+    "ppo_cmdp": {
+      "collision_rate": 0.74,
+      "mean_min_ttc": 2.817206033612828,
+      "rms_jerk": 2.5177366711111953,
+      "goal_completion": 0.26,
+      "fallback_rate": 0.0,
+      "lc_frequency": 0.0,
+      "lc_completion_rate": null,
+      "lc_anticipatory_frac": null,
+      "ego_fault_rate": 0.0,
+      "npc_fault_rate": 0.74,
+      "n_episodes": 150,
+      "n_steps_total": 3574,
+      "collision_rate_ci_low": 0.6644356718314847,
+      "collision_rate_ci_high": 0.8035786108718385
+    }
+  },
+  "eval_config": {
+    "n_seeds": 5,
+    "episodes_per_seed": 30,
+    "base_seed": 2026,
+    "fault_horizon_steps": 5
+  },
+  "scored": {
+    "ppo_unconstrained": {
+      "seed1": {
+        "collision_rate": 0.0,
+        "mean_min_ttc": null,
+        "rms_jerk": 0.09670574282319186,
+        "goal_completion": 1.0,
+        "fallback_rate": 0.0,
+        "lc_frequency": 0.0,
+        "lc_completion_rate": null,
+        "lc_anticipatory_frac": null,
+        "ego_fault_rate": 0.0,
+        "npc_fault_rate": 0.0,
+        "n_episodes": 150,
+        "n_steps_total": 6000,
+        "collision_rate_ci_low": 1.734723475976807e-18,
+        "collision_rate_ci_high": 0.0249702443680766
+      },
+      "seed7": {
+        "collision_rate": 0.0,
+        "mean_min_ttc": null,
+        "rms_jerk": 0.09670574282319186,
+        "goal_completion": 1.0,
+        "fallback_rate": 0.0,
+        "lc_frequency": 0.0,
+        "lc_completion_rate": null,
+        "lc_anticipatory_frac": null,
+        "ego_fault_rate": 0.0,
+        "npc_fault_rate": 0.0,
+        "n_episodes": 150,
+        "n_steps_total": 6000,
+        "collision_rate_ci_low": 1.734723475976807e-18,
+        "collision_rate_ci_high": 0.0249702443680766
+      },
+      "seed13": {
+        "collision_rate": 0.0,
+        "mean_min_ttc": null,
+        "rms_jerk": 0.09670574282319186,
+        "goal_completion": 1.0,
+        "fallback_rate": 0.0,
+        "lc_frequency": 0.0,
+        "lc_completion_rate": null,
+        "lc_anticipatory_frac": null,
+        "ego_fault_rate": 0.0,
+        "npc_fault_rate": 0.0,
+        "n_episodes": 150,
+        "n_steps_total": 6000,
+        "collision_rate_ci_low": 1.734723475976807e-18,
+        "collision_rate_ci_high": 0.0249702443680766
+      }
+    },
+    "ppo_cmdp": {
+      "seed1": {
+        "collision_rate": 0.013333333333333334,
+        "mean_min_ttc": 16.408372972617002,
+        "rms_jerk": 1.2799901660698694,
+        "goal_completion": 0.9866666666666667,
+        "fallback_rate": 0.0,
+        "lc_frequency": 0.0,
+        "lc_completion_rate": null,
+        "lc_anticipatory_frac": null,
+        "ego_fault_rate": 0.0,
+        "npc_fault_rate": 0.013333333333333334,
+        "n_episodes": 150,
+        "n_steps_total": 5990,
+        "collision_rate_ci_low": 0.0036641291512270503,
+        "collision_rate_ci_high": 0.04730690870036751
+      },
+      "seed7": {
+        "collision_rate": 0.1,
+        "mean_min_ttc": null,
+        "rms_jerk": 0.6956867638186492,
+        "goal_completion": 0.9,
+        "fallback_rate": 0.0,
+        "lc_frequency": 0.0,
+        "lc_completion_rate": null,
+        "lc_anticipatory_frac": null,
+        "ego_fault_rate": 0.0,
+        "npc_fault_rate": 0.1,
+        "n_episodes": 150,
+        "n_steps_total": 5715,
+        "collision_rate_ci_low": 0.061541383826314106,
+        "collision_rate_ci_high": 0.15843481166814719
+      },
+      "seed13": {
+        "collision_rate": 0.03333333333333333,
+        "mean_min_ttc": 13.659997796547689,
+        "rms_jerk": 0.9732386833953116,
+        "goal_completion": 0.9666666666666667,
+        "fallback_rate": 0.0,
+        "lc_frequency": 0.0,
+        "lc_completion_rate": null,
+        "lc_anticipatory_frac": null,
+        "ego_fault_rate": 0.0,
+        "npc_fault_rate": 0.03333333333333333,
+        "n_episodes": 150,
+        "n_steps_total": 5830,
+        "collision_rate_ci_low": 0.014320431898092546,
+        "collision_rate_ci_high": 0.07565179617877896
+      }
+    }
+  },
+  "best": {
+    "ppo_unconstrained": {
+      "seed": "seed1",
+      "metrics": {
+        "collision_rate": 0.0,
+        "mean_min_ttc": null,
+        "rms_jerk": 0.09670574282319186,
+        "goal_completion": 1.0,
+        "fallback_rate": 0.0,
+        "lc_frequency": 0.0,
+        "lc_completion_rate": null,
+        "lc_anticipatory_frac": null,
+        "ego_fault_rate": 0.0,
+        "npc_fault_rate": 0.0,
+        "n_episodes": 150,
+        "n_steps_total": 6000,
+        "collision_rate_ci_low": 1.734723475976807e-18,
+        "collision_rate_ci_high": 0.0249702443680766
+      }
+    },
+    "ppo_cmdp": {
+      "seed": "seed1",
+      "metrics": {
+        "collision_rate": 0.013333333333333334,
+        "mean_min_ttc": 16.408372972617002,
+        "rms_jerk": 1.2799901660698694,
+        "goal_completion": 0.9866666666666667,
+        "fallback_rate": 0.0,
+        "lc_frequency": 0.0,
+        "lc_completion_rate": null,
+        "lc_anticipatory_frac": null,
+        "ego_fault_rate": 0.0,
+        "npc_fault_rate": 0.013333333333333334,
+        "n_episodes": 150,
+        "n_steps_total": 5990,
+        "collision_rate_ci_low": 0.0036641291512270503,
+        "collision_rate_ci_high": 0.04730690870036751
+      }
+    }
+  }
+}

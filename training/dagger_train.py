@@ -419,7 +419,6 @@ def _retrain_on_dataset(
     the training DataLoader so expert steps can be upweighted relative to
     rollout steps (Fix 1).
     """
-    import copy
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -443,7 +442,6 @@ def _retrain_on_dataset(
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
     best_val_loss = float("inf")
-    best_state    = copy.deepcopy(policy.state_dict())
     patience_ctr  = 0
 
     for epoch in range(1, n_epochs + 1):
@@ -467,7 +465,6 @@ def _retrain_on_dataset(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_state = copy.deepcopy(policy.state_dict())
             policy.save(save_path)
             patience_ctr = 0
             marker = " *"
@@ -483,8 +480,7 @@ def _retrain_on_dataset(
                 print(f"    Early stopping at epoch {epoch}")
             break
 
-    policy.load_state_dict(best_state)
-    return policy
+    return MLPPolicy.load(save_path, device=device)
 
 
 def _print_dataset_stats(dataset: list[dict], label: str, verbose: bool) -> None:

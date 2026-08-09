@@ -1,0 +1,42 @@
+{
+  "config": {
+    "n_seeds": 5,
+    "episodes_per_seed": 30,
+    "base_seed": 2026,
+    "fault_horizon_steps": 5
+  },
+  "post": {
+    "ppo_unconstrained": {
+      "collision_rate": 0.92,
+      "mean_min_ttc": 2.047434789595329,
+      "rms_jerk": 2.9097725966212424,
+      "goal_completion": 0.07999999999999996,
+      "fallback_rate": 0.0,
+      "lc_frequency": 0.0,
+      "lc_completion_rate": null,
+      "lc_anticipatory_frac": null,
+      "ego_fault_rate": 0.0,
+      "npc_fault_rate": 0.92,
+      "n_episodes": 150,
+      "n_steps_total": 2776,
+      "collision_rate_ci_low": 0.8653786362494686,
+      "collision_rate_ci_high": 0.953646358481347
+    },
+    "ppo_cmdp": {
+      "collision_rate": 0.9333333333333333,
+      "mean_min_ttc": 1.8947547034623455,
+      "rms_jerk": 2.752906756810816,
+      "goal_completion": 0.06666666666666665,
+      "fallback_rate": 0.0,
+      "lc_frequency": 0.0,
+      "lc_completion_rate": null,
+      "lc_anticipatory_frac": null,
+      "ego_fault_rate": 0.0,
+      "npc_fault_rate": 0.9333333333333333,
+      "n_episodes": 150,
+      "n_steps_total": 2707,
+      "collision_rate_ci_low": 0.8816376448839411,
+      "collision_rate_ci_high": 0.9633881433303926
+    }
+  }
+}

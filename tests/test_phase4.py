@@ -200,6 +200,7 @@ class TestRolloutBuffer:
                 obs      = rng.random(OBS_DIM).astype(np.float32),
                 action   = int(rng.integers(0, N_ACTIONS)),
                 reward   = float(rng.standard_normal()),
+                cost     = float(rng.random()),
                 done     = bool(rng.random() < 0.1),
                 value    = float(rng.standard_normal()),
                 log_prob = float(-rng.random()),
@@ -237,6 +238,7 @@ class TestRolloutBuffer:
                 obs      = np.zeros(OBS_DIM, dtype=np.float32),
                 action   = 1,
                 reward   = 1.0,
+                cost     = 0.0,
                 done     = (t == 4),
                 value    = 0.5,
                 log_prob = -1.0,
@@ -270,7 +272,7 @@ class TestGAEAdvantageMath:
         """
         buf = RolloutBuffer()
         buf.add(obs=np.zeros(OBS_DIM, dtype=np.float32), action=0,
-                reward=1.0, done=False, value=1.0, log_prob=-1.0)
+            reward=1.0, cost=0.0, done=False, value=1.0, log_prob=-1.0)
         buf.compute_returns(last_value=2.0, gamma=0.99, gae_lambda=0.0,
                             device=torch.device("cpu"))
         expected = 1.0 + 0.99 * 2.0 - 1.0   # = 1.98
@@ -283,7 +285,7 @@ class TestGAEAdvantageMath:
         """
         buf = RolloutBuffer()
         buf.add(obs=np.zeros(OBS_DIM, dtype=np.float32), action=0,
-                reward=3.0, done=True, value=1.0, log_prob=-1.0)
+            reward=3.0, cost=0.0, done=True, value=1.0, log_prob=-1.0)
         buf.compute_returns(last_value=99.0, gamma=0.99, gae_lambda=0.0,
                             device=torch.device("cpu"))
         # done=True zeroes the (1 - done) mask → no bootstrap
@@ -338,6 +340,57 @@ class TestLagrangeUpdate:
         trainer._update_lambda(collision_rate=0.20)
         expected = 2.0 + 0.05 * (0.20 - 0.10)   # = 2.005
         assert abs(trainer.lambda_ - expected) < 1e-6
+
+    def test_cmdp_penalizes_collision_transitions_only(self, monkeypatch):
+        """Reward penalty should apply only where rollout cost_t == 1."""
+        trainer = self._make_cmdp(eps=0.10, lr=0.0, lambda_init=2.0)
+
+        buf = RolloutBuffer()
+        buf.add(
+            obs=np.zeros(OBS_DIM, dtype=np.float32),
+            action=1,
+            reward=1.0,
+            cost=0.0,
+            done=False,
+            value=0.0,
+            log_prob=-0.5,
+        )
+        buf.add(
+            obs=np.zeros(OBS_DIM, dtype=np.float32),
+            action=1,
+            reward=1.0,
+            cost=1.0,
+            done=True,
+            value=0.0,
+            log_prob=-0.5,
+        )
+        buf.compute_returns(
+            last_value=0.0,
+            gamma=trainer.ppo.cfg.gamma,
+            gae_lambda=trainer.ppo.cfg.gae_lambda,
+            device=trainer.ppo.device,
+        )
+
+        def _fake_collect_rollout(_env):
+            stats = {
+                "episodes": 1,
+                "mean_ep_ret": 0.0,
+                "mean_ep_shaped": 0.0,
+                "collision_count": 1,
+            }
+            return buf, stats
+
+        captured = {}
+
+        def _fake_update(_buf):
+            captured["rewards"] = list(_buf.rewards)
+            return {"pg_loss": 0.0, "vf_loss": 0.0, "ent_loss": 0.0}
+
+        monkeypatch.setattr(trainer.ppo, "collect_rollout", _fake_collect_rollout)
+        monkeypatch.setattr(trainer.ppo, "update", _fake_update)
+
+        trainer.train(env=None, n_iterations=1, verbose=False)
+        assert captured["rewards"] == [1.0, -1.0]
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +450,7 @@ class TestPPOTrainerUpdate:
                 obs      = rng.random(OBS_DIM).astype(np.float32),
                 action   = int(rng.integers(0, N_ACTIONS)),
                 reward   = float(rng.standard_normal()),
+                cost     = float(rng.random() < 0.05),
                 done     = bool(rng.random() < 0.05),
                 value    = float(rng.standard_normal()),
                 log_prob = float(-rng.random() - 0.1),

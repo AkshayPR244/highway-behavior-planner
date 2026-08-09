@@ -98,6 +98,7 @@ class RolloutBuffer:
     obs:       list = field(default_factory=list)
     actions:   list = field(default_factory=list)
     rewards:   list = field(default_factory=list)
+    costs:     list = field(default_factory=list)
     dones:     list = field(default_factory=list)
     values:    list = field(default_factory=list)
     log_probs: list = field(default_factory=list)
@@ -105,12 +106,14 @@ class RolloutBuffer:
     # Populated by compute_returns()
     returns:    torch.Tensor | None = None
     advantages: torch.Tensor | None = None
+    last_value: float = 0.0
 
     def add(
         self,
         obs:      np.ndarray,
         action:   int,
         reward:   float,
+        cost:     float,
         done:     bool,
         value:    float,
         log_prob: float,
@@ -118,6 +121,7 @@ class RolloutBuffer:
         self.obs.append(obs)
         self.actions.append(action)
         self.rewards.append(reward)
+        self.costs.append(cost)
         self.dones.append(done)
         self.values.append(value)
         self.log_probs.append(log_prob)
@@ -159,6 +163,7 @@ class RolloutBuffer:
             advantages[t] = gae
 
         returns = advantages + np.array(self.values, dtype=np.float32)
+        self.last_value = float(last_value)
 
         self.advantages = torch.tensor(advantages, dtype=torch.float32, device=device)
         self.returns    = torch.tensor(returns,    dtype=torch.float32, device=device)
@@ -264,7 +269,7 @@ class PPOTrainer:
 
         for _ in range(self.cfg.n_steps):
             obs_arr = np.asarray(obs, dtype=np.float32)
-            obs_t   = torch.tensor(obs_arr, dtype=torch.float32, device=self.device).unsqueeze(0)
+            obs_t   = torch.from_numpy(obs_arr).unsqueeze(0).to(self.device, dtype=torch.float32)
 
             with torch.no_grad():
                 dist, value = self.ac.forward(obs_t)
@@ -285,6 +290,7 @@ class PPOTrainer:
                 obs=obs_arr,
                 action=action_int,
                 reward=reward,
+                cost=float(info.get("crashed", False)),
                 done=done,
                 value=float(value.item()),
                 log_prob=float(log_prob.item()),
@@ -309,9 +315,9 @@ class PPOTrainer:
 
         # Bootstrap value at the end of the rollout
         if not done:
-            obs_t = torch.tensor(
-                np.asarray(obs, dtype=np.float32), dtype=torch.float32, device=self.device
-            ).unsqueeze(0)
+            obs_t = torch.from_numpy(np.asarray(obs, dtype=np.float32)).unsqueeze(0).to(
+                self.device, dtype=torch.float32
+            )
             with torch.no_grad():
                 _, last_val = self.ac.forward(obs_t)
             last_value = float(last_val.item())

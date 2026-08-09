@@ -32,7 +32,7 @@ IRL Cost Weights
     │
     ▼  Phase 4: PPO + CMDP
 Safety-Constrained RL Policy
-       holds collision ≤ 10% constraint via Lagrange multiplier
+  targets collision ≤ 10% via Lagrange multiplier tuning
        PPO-CMDP: collision 10%, goal 90%, jerk 1.348 m/s³
 ```
 
@@ -41,6 +41,10 @@ Safety-Constrained RL Policy
 ## Results
 
 All numbers: 20 evaluation episodes, seed=42.
+
+These are the original single-seed benchmark numbers. The stabilized production
+sweep promoted later best-checkpoint selections and is summarised in the Phase 4
+section below.
 
 | Metric | IDM Expert | DAgger-5 | IRL Policy | PPO-CMDP |
 |---|---|---|---|---|
@@ -51,8 +55,10 @@ All numbers: 20 evaluation episodes, seed=42.
 | Ego fault rate | 0.000 | 0.050 | 0.000 | 0.000 |
 | Final λ | — | — | — | 0.149 |
 
-PPO-**unconstrained** is also tracked and degenerates to 100% collision — a
-textbook episode-termination exploitation failure that motivates the CMDP.
+The naive last-checkpoint PPO-**unconstrained** run can also degenerate to
+100% collision — a textbook episode-termination exploitation failure that
+motivates the CMDP. The stabilized production sweep uses best-checkpoint
+selection to promote the non-degenerate checkpoint.
 
 ### Policy demos
 
@@ -107,11 +113,17 @@ uv pip install -e ".[dev]"
 
 # Verify
 python scripts/verify_deps.py
-pytest tests/ -q          # 174 tests, ~12 s
+pytest tests/ -q          # 180 tests, ~14 s
 ```
 
 Dependencies: `highway-env>=1.9`, `torch>=2.2`, `gymnasium>=0.29`,
 `numpy>=1.26`, `matplotlib>=3.8`. No GPU required.
+
+For reproducible installs, use pinned versions from `requirements-dev.lock`:
+
+```bash
+python -m pip install -r requirements-dev.lock
+```
 
 ---
 
@@ -138,14 +150,18 @@ python -m optimizer.weight_viz           # bar chart → results/irl_weights.png
 ```bash
 python -m scripts.train_ppo --iterations 100     # ~15 min on M4
 python -m scripts.train_ppo --iterations 10      # quick smoke-test (~90 s)
+python -m scripts.train_ppo --iterations 40 --lr 1e-4 --select-best-checkpoint
 
 # Options:
 #   --unconstrained-only   skip CMDP run
 #   --cmdp-only            skip unconstrained run
+#   --select-best-checkpoint   promote the best checkpoint after sweep
 #   --quiet                suppress per-iteration output
 ```
 
 Checkpoints: `results/ppo_unconstrained_final.pt`, `results/cmdp_final.pt`
+Sweep metrics: `results/train_ppo_metrics.jsonl`
+Production summary: `results/retrain_eval/<run>/production_summary.json`
 
 ### Visualisation
 
@@ -201,15 +217,18 @@ highway-planner/
 │   ├── ppo_trainer.py            # PPO with GAE, clipped surrogate
 │   └── cmdp_trainer.py           # Lagrange multiplier wrapper
 ├── scripts/
-│   ├── train_ppo.py              # Phase 4 entry point + comparison table
+│   ├── train_ppo.py              # Phase 4 entry point + comparison table + sweep support
 │   ├── render_policy.py          # record any policy as an annotated MP4
 │   ├── plot_training_curves.py   # plot collision rate, return, λ over iterations
+│   ├── summarize_production_results.py # summarise the promoted PPO/CMDP sweep
 │   └── verify_deps.py            # environment smoke-test
 ├── tests/
-│   ├── test_phase1.py            # 54 tests: IDM, metrics, safety, scenarios
+│   ├── test_phase1.py            # 48 tests: IDM, metrics, safety, scenarios
 │   ├── test_phase2.py            # 35 tests: BC, DAgger, MLPPolicy
 │   ├── test_phase3.py            # 51 tests: feature extractor, IRL, weights
-│   └── test_phase4.py            # 34 tests: ActorCritic, GAE, CMDP, shaping
+│   ├── test_phase4.py            # 35 tests: ActorCritic, GAE, CMDP, shaping
+│   ├── test_scenarios.py         # 10 tests: adversarial scenario regressions
+│   └── test_pipeline.py          # 1 test: end-to-end pipeline smoke test
 └── results/                      # checkpoints, weights, plots (gitignored)
 ```
 
@@ -550,7 +569,7 @@ behaviour.
 | PPO-unconstrained | PPO-CMDP |
 |:---:|:---:|
 | ![PPO-unconstrained](results/ppo_unc_demo.gif) | ![PPO-CMDP](results/cmdp_demo.gif) |
-| crashes at step 17 — episode-termination exploitation | completes the full 40-step episode |
+| raw last-checkpoint run can crash early — episode-termination exploitation | promoted checkpoint completes the full 40-step episode |
 
 ```bash
 # Regenerate:
@@ -564,6 +583,18 @@ Training curves (collision rate, mean return, λ over iterations):
 python -m scripts.train_ppo --iterations 100
 python -m scripts.plot_training_curves      # → results/training_curves.png
 ```
+
+For a stabilized retrain sweep, use `--select-best-checkpoint` and then
+summarise the resulting production run:
+
+```bash
+python -m scripts.train_ppo --iterations 40 --lr 1e-4 --select-best-checkpoint
+python -m scripts.summarize_production_results
+```
+
+The sweep writes a reproducibility bundle under `results/retrain_eval/<run>/`
+with the baseline checkpoints, scored candidates, and a
+`production_summary.json` artifact that records the promoted winner.
 
 ---
 
@@ -610,12 +641,13 @@ python -m scripts.plot_training_curves      # → results/training_curves.png
 
 ## Test coverage
 
-174 tests, all passing (`pytest tests/ -q`, ~12 s).
+180 tests, all passing (`pytest tests/ -q`, ~14 s).
 
 | Suite | Count | What it covers |
 |---|---|---|
-| `test_phase1.py` | 44 | IDM acceleration formula, TTC, jerk, env wrapper, safety projection, fault attribution |
+| `test_phase1.py` | 48 | IDM acceleration formula, TTC, jerk, env wrapper, safety projection, fault attribution |
 | `test_scenarios.py` | 10 | Scenario regression thresholds (collision rate, ego fault rate, LC frequency) |
 | `test_phase2.py` | 35 | MLPPolicy, BC training loop, DAgger aggregation, β-mixing schedule |
 | `test_phase3.py` | 51 | Feature extractor values, batch consistency, IRLPolicy save/load, trained weight sanity |
-| `test_phase4.py` | 34 | ActorCritic shapes, GAE maths, Lagrange update, reward shaper, PPO loss |
+| `test_phase4.py` | 35 | ActorCritic shapes, GAE maths, Lagrange update, reward shaper, PPO loss |
+| `test_pipeline.py` | 1 | Fast end-to-end pipeline smoke test |

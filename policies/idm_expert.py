@@ -14,20 +14,33 @@ DiscreteMetaAction mapping (highway-env default):
 import numpy as np
 import gymnasium as gym
 
+from config.settings import (
+    BehaviorAction,
+    IDM_ACCEL_COMFORT as _IDM_ACCEL_COMFORT,
+    IDM_DECEL_COMFORT as _IDM_DECEL_COMFORT,
+    IDM_DESIRED_HEADWAY as _IDM_DESIRED_HEADWAY,
+    IDM_DESIRED_SPEED as _IDM_DESIRED_SPEED,
+    IDM_MIN_SPACING as _IDM_MIN_SPACING,
+    MOBIL_ACCEL_GAIN_THRESHOLD as _MOBIL_ACCEL_GAIN_THRESHOLD,
+    MOBIL_B_SAFE as _MOBIL_B_SAFE,
+    MOBIL_POLITENESS as _MOBIL_POLITENESS,
+)
+
 from envs.highway_wrapper import make_env
 
 # IDM parameters
-IDM_DESIRED_SPEED = 25.0      # m/s
-IDM_MIN_SPACING = 5.0         # m
-IDM_DESIRED_HEADWAY = 1.5     # s
-IDM_ACCEL_COMFORT = 3.0       # m/s^2
-IDM_DECEL_COMFORT = 3.0       # m/s^2
+# Re-exported aliases preserve existing test/public imports.
+IDM_DESIRED_SPEED = _IDM_DESIRED_SPEED
+IDM_MIN_SPACING = _IDM_MIN_SPACING
+IDM_DESIRED_HEADWAY = _IDM_DESIRED_HEADWAY
+IDM_ACCEL_COMFORT = _IDM_ACCEL_COMFORT
+IDM_DECEL_COMFORT = _IDM_DECEL_COMFORT
 ACCEL_THRESHOLD = 0.5         # m/s^2
 
 # MOBIL parameters
-MOBIL_B_SAFE = 4.0            # m/s^2 — max deceleration we may impose on a new follower
-MOBIL_POLITENESS = 0.2        # weight on follower gain vs. ego gain (0 = purely selfish)
-MOBIL_ACCEL_GAIN_THRESHOLD = 0.1  # m/s^2 — minimum net gain to justify a lane change
+MOBIL_B_SAFE = _MOBIL_B_SAFE
+MOBIL_POLITENESS = _MOBIL_POLITENESS
+MOBIL_ACCEL_GAIN_THRESHOLD = _MOBIL_ACCEL_GAIN_THRESHOLD
 
 
 def _idm_acceleration(ego_speed: float, front_gap: float, front_rel_speed: float) -> float:
@@ -68,7 +81,7 @@ class IDMExpert:
             vehicle = neighbours[0] if front else (neighbours[1] if len(neighbours) > 1 else None)
             gap = ego.lane_distance_to(vehicle) if vehicle is not None else np.inf
             return vehicle, abs(gap)
-        except Exception:
+        except (AttributeError, IndexError, TypeError, ValueError):
             return None, np.inf
 
     def _mobil_safe(self, road, ego, target_lane_idx: int) -> bool:
@@ -167,7 +180,7 @@ class IDMExpert:
                 ego.lane_distance_to(front_vehicle)
                 if front_vehicle is not None else np.inf
             )
-        except Exception:
+        except (AttributeError, IndexError, TypeError, ValueError):
             front_vehicle, front_gap = None, np.inf
 
         front_rel_speed = (ego_speed - front_vehicle.speed) if front_vehicle is not None else 0.0
@@ -178,16 +191,16 @@ class IDMExpert:
         can_go_right = ego_lane_idx < n_lanes - 1
 
         if can_go_left and self._mobil_safe(road, ego, ego_lane_idx - 1):
-            return 0  # LANE_LEFT
+            return int(BehaviorAction.LANE_LEFT)
 
         if can_go_right and self._mobil_safe(road, ego, ego_lane_idx + 1):
-            return 2  # LANE_RIGHT
+            return int(BehaviorAction.LANE_RIGHT)
 
         if accel > ACCEL_THRESHOLD:
-            return 3   # FASTER
+            return int(BehaviorAction.FASTER)
         if accel < -ACCEL_THRESHOLD:
-            return 4   # SLOWER
-        return 1       # IDLE
+            return int(BehaviorAction.SLOWER)
+        return int(BehaviorAction.IDLE)
 
 
 def collect_expert_rollouts(

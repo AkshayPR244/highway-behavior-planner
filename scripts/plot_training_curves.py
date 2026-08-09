@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import pickle
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -63,7 +64,7 @@ def _load_history_from_pt(path: Path) -> list[dict] | None:
         data = torch.load(path, map_location="cpu", weights_only=False)
         if isinstance(data, dict) and "history" in data:
             return data["history"]
-    except Exception:
+    except (OSError, RuntimeError, ValueError, pickle.UnpicklingError):
         pass
     return None
 

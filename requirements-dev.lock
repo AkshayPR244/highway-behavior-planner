@@ -1,0 +1,11 @@
+highway-env==1.9.1
+torch==2.11.0
+stable-baselines3==2.8.0
+imitation==1.0.0
+numpy==2.4.4
+gymnasium==0.29.1
+matplotlib==3.10.9
+imageio==2.37.3
+imageio-ffmpeg==0.6.0
+pytest==9.0.3
+ruff==0.15.12

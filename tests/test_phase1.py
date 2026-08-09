@@ -261,6 +261,7 @@ from safety.safety_wrapper import (
     _project_front_gap,
     _project_rear_gap,
     is_action_safe,
+    SafetyFilteredEnv,
     LANE_LEFT, IDLE, LANE_RIGHT, FASTER, SLOWER,
 )
 
@@ -403,6 +404,48 @@ class TestIsActionSafe:
         )
         assert is_action_safe(state, LANE_RIGHT, dt=1.0, horizon=6, min_gap=4.0) is True
 
+    def test_lane_change_checks_target_lane_front_gap(self):
+        """
+        Current lane can be clear while target lane is blocked.
+        LANE_RIGHT should be unsafe when target-lane front gap is too small.
+        """
+        state = self._state(
+            ego_lane=0,
+            front_gap=100.0,
+            front_speed=25.0,
+            rear_gap_right=100.0,
+            rear_speed_right=25.0,
+        )
+        state["front_gap_right"] = 3.0
+        state["front_speed_right"] = 0.0
+        assert is_action_safe(state, LANE_RIGHT, dt=1.0, horizon=6, min_gap=4.0) is False
+
+
+class TestSafetyFilteredEnv:
+    """Integration checks for the gym wrapper API and fallback propagation."""
+
+    class _AlwaysIdle:
+        def act(self, obs: np.ndarray) -> int:
+            return IDLE
+
+    def test_step_uses_gym_action_signature_and_sets_fallback_flag(self):
+        from envs.highway_wrapper import make_env
+
+        base_env = make_env(seed=0)
+        safe_env = SafetyFilteredEnv(base_env, inner=self._AlwaysIdle())
+
+        obs, _ = safe_env.reset(seed=0)
+        action = IDLE
+        _, _, terminated, truncated, info = safe_env.step(action)
+
+        assert "fallback" in info
+        assert isinstance(info["fallback"], bool)
+
+        if terminated or truncated:
+            safe_env.reset(seed=1)
+
+        safe_env.close()
+
 
 # ---------------------------------------------------------------------------
 # Fault attribution
@@ -484,6 +527,18 @@ class TestWouldCrashWithIdle:
         # After 1 s: ego [25, 0], NPC [25, 8], distance = 8 m > COLLISION_DIST (≈5.39 m)
         assert would_crash_with_idle(snap, dt=1.0) is False
 
+    def test_horizon_detects_collision_not_visible_in_one_step(self):
+        """
+        One-step projection can miss collisions that become inevitable shortly after.
+        """
+        snap = _make_snapshot(
+            ego_pos=[0, 0],
+            ego_speed=25.0,
+            npcs=[{"pos": [-20, 0], "speed": 35.0}],
+        )
+        assert would_crash_with_idle(snap, dt=1.0, horizon_steps=1) is False
+        assert would_crash_with_idle(snap, dt=1.0, horizon_steps=2) is True
+
 
 class TestClassifyFault:
     def test_unavoidable_crash_is_npc_fault(self):
@@ -511,4 +566,14 @@ class TestClassifyFault:
         bad_snap = {"ego": None, "npcs": []}
         result = classify_fault(bad_snap, dt=1.0)
         assert result == "ambiguous"
+
+    def test_fault_classification_depends_on_horizon(self):
+        """A longer counterfactual horizon can flip classification to NPC fault."""
+        snap = _make_snapshot(
+            ego_pos=[0, 0],
+            ego_speed=25.0,
+            npcs=[{"pos": [-20, 0], "speed": 35.0}],
+        )
+        assert classify_fault(snap, dt=1.0, horizon_steps=1) == "ego"
+        assert classify_fault(snap, dt=1.0, horizon_steps=2) == "npc"
 

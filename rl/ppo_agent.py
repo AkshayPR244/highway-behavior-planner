@@ -44,10 +44,10 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
+from config.settings import N_ACTIONS
 from envs.highway_wrapper import OBS_FEATURES, OBS_VEHICLES
 
 OBS_DIM   = OBS_VEHICLES * len(OBS_FEATURES)  # 25
-N_ACTIONS = 5
 
 
 class ActorCritic(nn.Module):

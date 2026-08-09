@@ -28,15 +28,12 @@ from __future__ import annotations
 
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Callable, Protocol
+from typing import Protocol
 
 import gymnasium as gym
 
+from config.settings import ANTICIPATORY_TTC_THRESHOLD
 from metrics.fault_attribution import snapshot_pre_step, classify_fault
-
-# Threshold in seconds: a lane change issued while closing on a front vehicle
-# with TTC above this value is classified as anticipatory (acting early).
-ANTICIPATORY_TTC_THRESHOLD = 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +69,8 @@ class EvalResults:
     npc_fault_rate: float        # unavoidable collisions / n_episodes
     n_episodes: int
     n_steps_total: int
+    collision_rate_ci_low: float = float("nan")
+    collision_rate_ci_high: float = float("nan")
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +110,7 @@ def _approach_state(env: gym.Env) -> tuple[bool, float]:
         if closing_speed <= 0 or gap <= 0:
             return False, np.inf
         return True, gap / closing_speed
-    except Exception:
+    except (AttributeError, IndexError, TypeError, ValueError):
         return False, np.inf
 
 
@@ -136,8 +135,20 @@ def _compute_ttc(env: gym.Env) -> float:
         if closing_speed <= 0 or gap <= 0:
             return np.inf
         return gap / closing_speed
-    except Exception:
+    except (AttributeError, IndexError, TypeError, ValueError):
         return np.inf
+
+
+def _wilson_ci(successes: int, n: int, z: float = 1.959963984540054) -> tuple[float, float]:
+    """Wilson score interval for a Bernoulli proportion."""
+    if n <= 0:
+        return float("nan"), float("nan")
+    p = successes / n
+    z2 = z * z
+    denom = 1.0 + z2 / n
+    center = (p + z2 / (2.0 * n)) / denom
+    margin = (z / denom) * np.sqrt((p * (1.0 - p) / n) + (z2 / (4.0 * n * n)))
+    return max(0.0, center - margin), min(1.0, center + margin)
 
 
 def _compute_jerk(speeds: list[float], dt: float) -> float:
@@ -164,6 +175,7 @@ def evaluate(
     env: gym.Env,
     n_episodes: int = 20,
     seed: int = 0,
+    fault_horizon_steps: int = 1,
 ) -> EvalResults:
     """
     Roll out `policy` in `env` for `n_episodes` and return aggregated metrics.
@@ -222,7 +234,7 @@ def evaluate(
 
         # Fault attribution: classify who caused the collision
         if stats.collision:
-            stats.fault = classify_fault(pre_step, dt)
+            stats.fault = classify_fault(pre_step, dt, horizon_steps=fault_horizon_steps)
 
         all_episode_stats.append(stats)
 
@@ -248,6 +260,7 @@ def evaluate(
     )
     n_ego_fault = sum(1 for s in all_episode_stats if s.fault == "ego")
     n_npc_fault = sum(1 for s in all_episode_stats if s.fault == "npc")
+    coll_ci_low, coll_ci_high = _wilson_ci(n_collisions, n_episodes)
 
     return EvalResults(
         collision_rate=n_collisions / n_episodes,
@@ -262,6 +275,81 @@ def evaluate(
         npc_fault_rate=n_npc_fault / n_episodes,
         n_episodes=n_episodes,
         n_steps_total=n_total_steps,
+        collision_rate_ci_low=coll_ci_low,
+        collision_rate_ci_high=coll_ci_high,
+    )
+
+
+def evaluate_across_seeds(
+    policy: Policy,
+    env: gym.Env,
+    n_seeds: int,
+    episodes_per_seed: int,
+    base_seed: int = 0,
+    fault_horizon_steps: int = 1,
+) -> EvalResults:
+    """
+    Evaluate a policy across multiple seeds and aggregate metrics.
+
+    Rate metrics are averaged with sensible denominators:
+      - per-episode rates by total episodes
+      - per-step rates by total steps
+      - lane-change fractions by per-seed mean (ignoring NaNs)
+    """
+    if n_seeds < 1:
+        raise ValueError("n_seeds must be >= 1")
+    if episodes_per_seed < 1:
+        raise ValueError("episodes_per_seed must be >= 1")
+
+    per_seed: list[EvalResults] = []
+    for s in range(n_seeds):
+        per_seed.append(
+            evaluate(
+                policy=policy,
+                env=env,
+                n_episodes=episodes_per_seed,
+                seed=base_seed + s,
+                fault_horizon_steps=fault_horizon_steps,
+            )
+        )
+
+    total_episodes = n_seeds * episodes_per_seed
+    total_steps = sum(r.n_steps_total for r in per_seed)
+
+    collision_count = int(round(sum(r.collision_rate * r.n_episodes for r in per_seed)))
+    ego_fault_count = int(round(sum(r.ego_fault_rate * r.n_episodes for r in per_seed)))
+    npc_fault_count = int(round(sum(r.npc_fault_rate * r.n_episodes for r in per_seed)))
+
+    lc_completion_vals = [r.lc_completion_rate for r in per_seed if r.lc_completion_rate == r.lc_completion_rate]
+    lc_anticipatory_vals = [r.lc_anticipatory_frac for r in per_seed if r.lc_anticipatory_frac == r.lc_anticipatory_frac]
+
+    coll_ci_low, coll_ci_high = _wilson_ci(collision_count, total_episodes)
+
+    return EvalResults(
+        collision_rate=collision_count / total_episodes,
+        mean_min_ttc=float(np.mean([r.mean_min_ttc for r in per_seed])),
+        rms_jerk=float(np.mean([r.rms_jerk for r in per_seed])),
+        goal_completion=1.0 - (collision_count / total_episodes),
+        fallback_rate=(
+            sum(r.fallback_rate * r.n_steps_total for r in per_seed) / total_steps
+            if total_steps > 0 else 0.0
+        ),
+        lc_frequency=(
+            sum(r.lc_frequency * r.n_steps_total for r in per_seed) / total_steps
+            if total_steps > 0 else 0.0
+        ),
+        lc_completion_rate=(
+            float(np.mean(lc_completion_vals)) if lc_completion_vals else float("nan")
+        ),
+        lc_anticipatory_frac=(
+            float(np.mean(lc_anticipatory_vals)) if lc_anticipatory_vals else float("nan")
+        ),
+        ego_fault_rate=ego_fault_count / total_episodes,
+        npc_fault_rate=npc_fault_count / total_episodes,
+        n_episodes=total_episodes,
+        n_steps_total=total_steps,
+        collision_rate_ci_low=coll_ci_low,
+        collision_rate_ci_high=coll_ci_high,
     )
 
 
@@ -282,6 +370,10 @@ def print_table(results: EvalResults, label: str = "Policy") -> None:
         ("Policy",               label),
         ("Episodes",             str(results.n_episodes)),
         ("Collision rate",       f"{results.collision_rate:.3f}"),
+        (
+            "Collision 95% CI",
+            _fmt(results.collision_rate_ci_low) + "-" + _fmt(results.collision_rate_ci_high),
+        ),
         ("Goal completion",      f"{results.goal_completion:.3f}"),
         ("Mean min TTC (s)",     f"{results.mean_min_ttc:.2f}"),
         ("RMS jerk (m/s³)",      f"{results.rms_jerk:.3f}"),

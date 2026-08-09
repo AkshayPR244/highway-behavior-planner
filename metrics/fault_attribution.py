@@ -11,9 +11,9 @@ How it works
 ------------
 Before every env.step(), call `snapshot_pre_step(env)` to capture the full
 kinematic state of every vehicle.  If a crash is detected after the step,
-call `classify_fault(snapshot, dt)` to run a single constant-velocity
+call `classify_fault(snapshot, dt, horizon_steps)` to run a constant-velocity
 forward projection of that saved state with ego doing IDLE and check whether
-any NPC center comes within COLLISION_DIST of the ego center.
+any NPC center comes within COLLISION_DIST of the ego center over the horizon.
 
 Constant-velocity projection
 -----------------------------
@@ -106,21 +106,28 @@ def _project(pos: np.ndarray, speed: float, heading: float, dt: float) -> np.nda
 # Counterfactual check
 # ---------------------------------------------------------------------------
 
-def would_crash_with_idle(snapshot: dict, dt: float) -> bool:
+def would_crash_with_idle(snapshot: dict, dt: float, horizon_steps: int = 1) -> bool:
     """
-    Simulate one policy step from `snapshot` with ego doing IDLE.
+    Simulate `horizon_steps` policy steps from `snapshot` with ego doing IDLE.
 
     IDLE = constant speed, constant heading (no acceleration, no steering).
-    Returns True if any NPC center comes within COLLISION_DIST of the ego center.
+    Returns True if any NPC center comes within COLLISION_DIST of the ego center
+    at any projected step.
     """
     ego = snapshot["ego"]
-    ego_pos_after = _project(ego["pos"], ego["speed"], ego["heading"], dt)
+    if horizon_steps < 1:
+        raise ValueError("horizon_steps must be >= 1")
 
-    for npc in snapshot["npcs"]:
-        npc_pos_after = _project(npc["pos"], npc["speed"], npc["heading"], dt)
-        dist = float(np.linalg.norm(ego_pos_after - npc_pos_after))
-        if dist < COLLISION_DIST:
-            return True
+    ego_pos = np.array(ego["pos"], dtype=float)
+    npc_pos = [np.array(npc["pos"], dtype=float) for npc in snapshot["npcs"]]
+
+    for _ in range(horizon_steps):
+        ego_pos = _project(ego_pos, ego["speed"], ego["heading"], dt)
+        for i, npc in enumerate(snapshot["npcs"]):
+            npc_pos[i] = _project(npc_pos[i], npc["speed"], npc["heading"], dt)
+            dist = float(np.linalg.norm(ego_pos - npc_pos[i]))
+            if dist < COLLISION_DIST:
+                return True
     return False
 
 
@@ -128,7 +135,7 @@ def would_crash_with_idle(snapshot: dict, dt: float) -> bool:
 # Fault classification
 # ---------------------------------------------------------------------------
 
-def classify_fault(snapshot: dict, dt: float) -> str:
+def classify_fault(snapshot: dict, dt: float, horizon_steps: int = 1) -> str:
     """
     Classify who caused a collision that just occurred.
 
@@ -148,8 +155,8 @@ def classify_fault(snapshot: dict, dt: float) -> str:
     "ambiguous" — geometry check failed (snapshot missing or malformed)
     """
     try:
-        if would_crash_with_idle(snapshot, dt):
+        if would_crash_with_idle(snapshot, dt, horizon_steps=horizon_steps):
             return "npc"
         return "ego"
-    except Exception:
+    except (KeyError, TypeError, ValueError):
         return "ambiguous"
