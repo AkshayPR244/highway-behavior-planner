@@ -27,11 +27,13 @@ We use a binary step cost per episode: 1 if the episode ended in a collision,
 0 otherwise.  This is the simplest formulation that directly minimises the
 collision rate.
 
-The policy-side penalty is applied directly in rollout rewards:
-    r'_t = r_t − λ · c_t
+The policy-side penalty uses a lagrangian advantage term during PPO updates:
 
-where c_t is a binary per-step collision cost label (1 on collision
-transitions, 0 otherwise) stored in the rollout buffer.
+    A_L(s, a) = A_r(s, a) − λ · A_c(s, a)
+
+where the reward and cost critics are trained separately and the cost signal
+is a binary per-step collision label (1 on collision transitions, 0 otherwise)
+stored in the rollout buffer.
 
 λ history
 ----------
@@ -140,12 +142,11 @@ class CMDPTrainer:
         """
         Run *n_iterations* of CMDP-PPO.
 
-        At each iteration:
-          1. Collect rollout with current policy
-          2. Compute per-rollout collision rate
-          3. Apply reward penalty per transition: r'_t = r_t - λ·c_t
-          4. Run PPO update
-          5. Update λ via dual gradient step
+                At each iteration:
+                    1. Collect rollout with current policy
+                    2. Compute per-rollout collision rate
+                    3. Run PPO-Lagrangian update using reward and cost advantages
+                    4. Update λ via dual gradient step
 
         Returns
         -------
@@ -173,27 +174,10 @@ class CMDPTrainer:
                 rollout_stats["collision_count"] / max(rollout_stats["episodes"], 1)
             )
 
-            # ---- 2. Subtract λ · collision penalty from rewards ----
-            # Costs are per-transition labels collected during rollout:
-            #   cost_t = 1.0 on collision transitions, else 0.0.
-            if self._lambda > 0.0:
-                for t in range(n_steps):
-                    buf.rewards[t] -= self._lambda * float(buf.costs[t])
+            # ---- 2. PPO-Lagrangian update ----
+            update_stats = self.ppo.update(buf, lagrange_lambda=self._lambda)
 
-                # Recompute returns with the original rollout bootstrap.
-                buf.advantages = None
-                buf.returns    = None
-                buf.compute_returns(
-                    last_value=buf.last_value,
-                    gamma=self.ppo.cfg.gamma,
-                    gae_lambda=self.ppo.cfg.gae_lambda,
-                    device=self.ppo.device,
-                )
-
-            # ---- 3. PPO update ----
-            update_stats = self.ppo.update(buf)
-
-            # ---- 4. Update λ ----
+            # ---- 3. Update λ ----
             self._update_lambda(collision_rate)
             self.lambda_history.append(self._lambda)
             self.collision_history.append(collision_rate)

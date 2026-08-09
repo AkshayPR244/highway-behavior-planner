@@ -5,9 +5,10 @@ Architecture
 ------------
 Shared trunk: 25 → Linear(256) → Tanh → Linear(256) → Tanh
 
-Two heads on top of the trunk:
-    Actor  head: Linear(256 → 5) → Categorical distribution
-    Critic head: Linear(256 → 1) → scalar V(s)
+Three heads on top of the trunk:
+    Actor head: Linear(256 → 5) → Categorical distribution
+    Reward critic: Linear(256 → 1) → scalar V_r(s)
+    Cost critic: Linear(256 → 1) → scalar V_c(s)
 
 Design notes
 ------------
@@ -85,9 +86,11 @@ class ActorCritic(nn.Module):
         )
 
         # Policy head: logits → Categorical distribution
-        self.actor_head  = nn.Linear(hidden, n_actions)
-        # Value head: scalar V(s)
-        self.critic_head = nn.Linear(hidden, 1)
+        self.actor_head = nn.Linear(hidden, n_actions)
+        # Reward value head: scalar V_r(s)
+        self.reward_value_head = nn.Linear(hidden, 1)
+        # Cost value head: scalar V_c(s)
+        self.cost_value_head = nn.Linear(hidden, 1)
 
         self.to(self.device)
 
@@ -103,14 +106,16 @@ class ActorCritic(nn.Module):
                 nn.init.zeros_(m.bias)
         nn.init.orthogonal_(self.actor_head.weight,  gain=0.01)
         nn.init.zeros_(self.actor_head.bias)
-        nn.init.orthogonal_(self.critic_head.weight, gain=1.0)
-        nn.init.zeros_(self.critic_head.bias)
+        nn.init.orthogonal_(self.reward_value_head.weight, gain=1.0)
+        nn.init.zeros_(self.reward_value_head.bias)
+        nn.init.orthogonal_(self.cost_value_head.weight, gain=1.0)
+        nn.init.zeros_(self.cost_value_head.bias)
 
     # ------------------------------------------------------------------
     # Core forward passes
     # ------------------------------------------------------------------
 
-    def forward(self, obs: torch.Tensor) -> tuple[Categorical, torch.Tensor]:
+    def forward(self, obs: torch.Tensor) -> tuple[Categorical, torch.Tensor, torch.Tensor]:
         """
         Full forward pass.
 
@@ -122,18 +127,21 @@ class ActorCritic(nn.Module):
         -------
         dist  : Categorical
             Action distribution π(·|obs).
-        value : torch.Tensor, shape (B,)
-            State value estimates V(obs).
+        reward_value : torch.Tensor, shape (B,)
+            Reward critic estimates V_r(obs).
+        cost_value : torch.Tensor, shape (B,)
+            Cost critic estimates V_c(obs).
         """
         features = self.trunk(obs)                       # (B, hidden)
         logits   = self.actor_head(features)             # (B, n_actions)
-        value    = self.critic_head(features).squeeze(-1)  # (B,)
+        reward_value = self.reward_value_head(features).squeeze(-1)  # (B,)
+        cost_value   = self.cost_value_head(features).squeeze(-1)    # (B,)
         dist     = Categorical(logits=logits)
-        return dist, value
+        return dist, reward_value, cost_value
 
     def get_action_and_value(
         self, obs: torch.Tensor, action: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Used inside the PPO update loop.
 
@@ -147,14 +155,15 @@ class ActorCritic(nn.Module):
         action    : (B,) int
         log_prob  : (B,) log π(action | obs)
         entropy   : (B,) H[π(·|obs)]
-        value     : (B,)
+        reward_value : (B,)
+        cost_value   : (B,)
         """
-        dist, value = self.forward(obs)
+        dist, reward_value, cost_value = self.forward(obs)
         if action is None:
             action = dist.sample()
         log_prob = dist.log_prob(action)
         entropy  = dist.entropy()
-        return action, log_prob, entropy, value
+        return action, log_prob, entropy, reward_value, cost_value
 
     # ------------------------------------------------------------------
     # act() — matches the policy interface used by evaluate()
@@ -177,7 +186,7 @@ class ActorCritic(nn.Module):
         """
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            dist, _ = self.forward(obs_t)
+            dist, _, _ = self.forward(obs_t)
         return int(dist.probs.argmax(dim=-1).item())
 
     def act_stochastic(self, obs: np.ndarray) -> tuple[int, float]:
@@ -191,7 +200,7 @@ class ActorCritic(nn.Module):
         """
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
-            dist, _ = self.forward(obs_t)
+            dist, _, _ = self.forward(obs_t)
             action   = dist.sample()
             log_prob = dist.log_prob(action)
         return int(action.item()), float(log_prob.item())
@@ -221,9 +230,9 @@ class ActorCritic(nn.Module):
         data  = torch.load(path, map_location=device, weights_only=False)
         # Support both old format (bare state_dict) and new format (dict with key)
         if isinstance(data, dict) and "state_dict" in data:
-            model.load_state_dict(data["state_dict"])
+            model.load_state_dict(data["state_dict"], strict=False)
         else:
-            model.load_state_dict(data)
+            model.load_state_dict(data, strict=False)
         return model
 
     def load_actor_weights_from_mlp(self, mlp_path: str | Path) -> None:
@@ -236,8 +245,8 @@ class ActorCritic(nn.Module):
             net.4.weight, net.4.bias   (Linear 256→5, actor logits)
 
         We copy layers 0 and 2 into trunk.0 and trunk.2 respectively.
-        The actor head is copied from net.4.  The critic head is left at its
-        orthogonal initialisation — we have no DAgger value targets to warm-start it.
+        The actor head is copied from net.4.  The value heads are left at their
+        orthogonal initialisations — we have no DAgger value targets to warm-start them.
 
         Note: MLPPolicy uses ReLU; we use Tanh.  The weight magnitudes are
         compatible (both ~√2/fan_in scale), but activations differ.  In practice

@@ -51,7 +51,8 @@ def _fmt(value: object) -> str:
 def _print_policy_block(label: str, metrics: dict) -> None:
     print(f"{label}")
     print(f"  collision_rate: {_fmt(metrics.get('collision_rate'))}")
-    print(f"  goal_completion: {_fmt(metrics.get('goal_completion'))}")
+    print(f"  survival_rate: {_fmt(metrics.get('survival_rate', metrics.get('goal_completion')))}")
+    print(f"  success_rate: {_fmt(metrics.get('success_rate'))}")
     print(f"  mean_min_ttc: {_fmt(metrics.get('mean_min_ttc'))}")
     print(f"  rms_jerk: {_fmt(metrics.get('rms_jerk'))}")
     if "collision_rate_ci_low" in metrics and "collision_rate_ci_high" in metrics:
@@ -93,12 +94,14 @@ def main() -> None:
     print(
         f"  PPO-unconstrained: {best['ppo_unconstrained']['seed']} "
         f"(collision={_fmt(best['ppo_unconstrained']['metrics'].get('collision_rate'))}, "
-        f"goal={_fmt(best['ppo_unconstrained']['metrics'].get('goal_completion'))})"
+        f"survival={_fmt(best['ppo_unconstrained']['metrics'].get('survival_rate', best['ppo_unconstrained']['metrics'].get('goal_completion')))}, "
+        f"success={_fmt(best['ppo_unconstrained']['metrics'].get('success_rate'))})"
     )
     print(
         f"  PPO-CMDP: {best['ppo_cmdp']['seed']} "
         f"(collision={_fmt(best['ppo_cmdp']['metrics'].get('collision_rate'))}, "
-        f"goal={_fmt(best['ppo_cmdp']['metrics'].get('goal_completion'))})"
+        f"survival={_fmt(best['ppo_cmdp']['metrics'].get('survival_rate', best['ppo_cmdp']['metrics'].get('goal_completion')))}, "
+        f"success={_fmt(best['ppo_cmdp']['metrics'].get('success_rate'))})"
     )
     print()
 
@@ -108,7 +111,8 @@ def main() -> None:
         for seed_name, metrics in by_seed.items():
             print(
                 f"    {seed_name}: collision={_fmt(metrics.get('collision_rate'))}, "
-                f"goal={_fmt(metrics.get('goal_completion'))}, "
+                f"survival={_fmt(metrics.get('survival_rate', metrics.get('goal_completion')))}, "
+                f"success={_fmt(metrics.get('success_rate'))}, "
                 f"rms_jerk={_fmt(metrics.get('rms_jerk'))}"
             )
 

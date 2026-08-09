@@ -70,6 +70,7 @@ class PPOConfig:
 
     # Loss coefficients
     vf_coef:    float = 0.5    # critic loss weight
+    cost_vf_coef: float = 0.5  # cost critic loss weight
     ent_coef:   float = 0.01   # entropy bonus (encourages exploration)
 
     # Optimisation
@@ -90,7 +91,7 @@ class PPOConfig:
 @dataclass
 class RolloutBuffer:
     """
-    Stores one rollout of (obs, action, reward, done, value, log_prob).
+    Stores one rollout of (obs, action, reward, cost, done, reward_value, cost_value, log_prob).
 
     All tensors have shape (T,) or (T, obs_dim).  After `compute_returns`,
     `returns` and `advantages` are also populated.
@@ -101,12 +102,16 @@ class RolloutBuffer:
     costs:     list = field(default_factory=list)
     dones:     list = field(default_factory=list)
     values:    list = field(default_factory=list)
+    cost_values: list = field(default_factory=list)
     log_probs: list = field(default_factory=list)
 
     # Populated by compute_returns()
-    returns:    torch.Tensor | None = None
-    advantages: torch.Tensor | None = None
+    reward_returns:    torch.Tensor | None = None
+    reward_advantages: torch.Tensor | None = None
+    cost_returns:    torch.Tensor | None = None
+    cost_advantages: torch.Tensor | None = None
     last_value: float = 0.0
+    last_cost_value: float = 0.0
 
     def add(
         self,
@@ -117,13 +122,17 @@ class RolloutBuffer:
         done:     bool,
         value:    float,
         log_prob: float,
+        cost_value: float | None = None,
     ) -> None:
+        if cost_value is None:
+            cost_value = 0.0
         self.obs.append(obs)
         self.actions.append(action)
         self.rewards.append(reward)
         self.costs.append(cost)
         self.dones.append(done)
         self.values.append(value)
+        self.cost_values.append(cost_value)
         self.log_probs.append(log_prob)
 
     def compute_returns(
@@ -132,9 +141,10 @@ class RolloutBuffer:
         gamma:      float,
         gae_lambda: float,
         device:     torch.device,
+        last_cost_value: float = 0.0,
     ) -> None:
         """
-        Compute GAE advantages and discounted returns.
+        Compute reward and cost GAE advantages plus discounted returns.
 
         Parameters
         ----------
@@ -146,37 +156,53 @@ class RolloutBuffer:
         device : torch.device
         """
         T = len(self.rewards)
-        advantages = np.zeros(T, dtype=np.float32)
-        gae        = 0.0
+        reward_advantages = np.zeros(T, dtype=np.float32)
+        cost_advantages = np.zeros(T, dtype=np.float32)
+        reward_gae = 0.0
+        cost_gae = 0.0
 
         # Extend values with the bootstrap
         values_ext = self.values + [last_value]
+        cost_values_ext = self.cost_values + [last_cost_value]
 
         for t in reversed(range(T)):
             not_done = 1.0 - float(self.dones[t])
-            delta    = (
+            reward_delta = (
                 self.rewards[t]
                 + gamma * values_ext[t + 1] * not_done
                 - values_ext[t]
             )
-            gae          = delta + gamma * gae_lambda * not_done * gae
-            advantages[t] = gae
+            reward_gae = reward_delta + gamma * gae_lambda * not_done * reward_gae
+            reward_advantages[t] = reward_gae
 
-        returns = advantages + np.array(self.values, dtype=np.float32)
+            cost_delta = (
+                self.costs[t]
+                + gamma * cost_values_ext[t + 1] * not_done
+                - cost_values_ext[t]
+            )
+            cost_gae = cost_delta + gamma * gae_lambda * not_done * cost_gae
+            cost_advantages[t] = cost_gae
+
+        reward_returns = reward_advantages + np.array(self.values, dtype=np.float32)
+        cost_returns = cost_advantages + np.array(self.cost_values, dtype=np.float32)
         self.last_value = float(last_value)
+        self.last_cost_value = float(last_cost_value)
 
-        self.advantages = torch.tensor(advantages, dtype=torch.float32, device=device)
-        self.returns    = torch.tensor(returns,    dtype=torch.float32, device=device)
+        self.reward_advantages = torch.tensor(reward_advantages, dtype=torch.float32, device=device)
+        self.reward_returns    = torch.tensor(reward_returns,    dtype=torch.float32, device=device)
+        self.cost_advantages   = torch.tensor(cost_advantages,   dtype=torch.float32, device=device)
+        self.cost_returns       = torch.tensor(cost_returns,      dtype=torch.float32, device=device)
 
     def to_tensors(
         self, device: torch.device
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return (obs_t, actions_t, log_probs_t, values_t) tensors."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (obs_t, actions_t, log_probs_t, reward_values_t, cost_values_t) tensors."""
         obs_t      = torch.tensor(np.array(self.obs),      dtype=torch.float32, device=device)
         actions_t  = torch.tensor(np.array(self.actions),  dtype=torch.long,    device=device)
         log_probs_t = torch.tensor(np.array(self.log_probs), dtype=torch.float32, device=device)
         values_t   = torch.tensor(np.array(self.values),   dtype=torch.float32, device=device)
-        return obs_t, actions_t, log_probs_t, values_t
+        cost_values_t = torch.tensor(np.array(self.cost_values), dtype=torch.float32, device=device)
+        return obs_t, actions_t, log_probs_t, values_t, cost_values_t
 
     def minibatches(
         self,
@@ -188,10 +214,11 @@ class RolloutBuffer:
         Yield random mini-batches from the buffer.
 
         Each mini-batch is a tuple:
-            (obs, actions, old_log_probs, old_values, advantages, returns)
+            (obs, actions, old_log_probs, reward_values, cost_values,
+             reward_advantages, reward_returns, cost_advantages, cost_returns)
         """
         T = len(self.rewards)
-        obs_t, actions_t, lp_t, val_t = self.to_tensors(device)
+        obs_t, actions_t, lp_t, val_t, cost_val_t = self.to_tensors(device)
         indices = rng.permutation(T)
 
         for start in range(0, T, batch_size):
@@ -201,8 +228,11 @@ class RolloutBuffer:
                 actions_t[idx],
                 lp_t[idx],
                 val_t[idx],
-                self.advantages[idx],
-                self.returns[idx],
+                cost_val_t[idx],
+                self.reward_advantages[idx],
+                self.reward_returns[idx],
+                self.cost_advantages[idx],
+                self.cost_returns[idx],
             )
 
 
@@ -272,7 +302,7 @@ class PPOTrainer:
             obs_t   = torch.from_numpy(obs_arr).unsqueeze(0).to(self.device, dtype=torch.float32)
 
             with torch.no_grad():
-                dist, value = self.ac.forward(obs_t)
+                dist, reward_value, cost_value = self.ac.forward(obs_t)
                 action      = dist.sample()
                 log_prob    = dist.log_prob(action)
 
@@ -292,7 +322,8 @@ class PPOTrainer:
                 reward=reward,
                 cost=float(info.get("crashed", False)),
                 done=done,
-                value=float(value.item()),
+                value=float(reward_value.item()),
+                cost_value=float(cost_value.item()),
                 log_prob=float(log_prob.item()),
             )
 
@@ -319,16 +350,19 @@ class PPOTrainer:
                 self.device, dtype=torch.float32
             )
             with torch.no_grad():
-                _, last_val = self.ac.forward(obs_t)
-            last_value = float(last_val.item())
+                _, last_reward_val, last_cost_val = self.ac.forward(obs_t)
+            last_value = float(last_reward_val.item())
+            last_cost_value = float(last_cost_val.item())
         else:
             last_value = 0.0
+            last_cost_value = 0.0
 
         buf.compute_returns(
             last_value=last_value,
             gamma=self.cfg.gamma,
             gae_lambda=self.cfg.gae_lambda,
             device=self.device,
+            last_cost_value=last_cost_value,
         )
 
         # Summarise
@@ -342,41 +376,50 @@ class PPOTrainer:
     # PPO update
     # ------------------------------------------------------------------
 
-    def update(self, buf: RolloutBuffer, extra_loss_fn=None) -> dict:
+    def update(self, buf: RolloutBuffer, lagrange_lambda: float = 0.0) -> dict:
         """
         Run K epochs of mini-batch PPO updates on *buf*.
 
         Parameters
         ----------
         buf : RolloutBuffer  (with returns and advantages populated)
-        extra_loss_fn : callable(obs_batch) → scalar Tensor or None
-            Hook for the CMDP trainer to inject the Lagrange safety penalty.
+        lagrange_lambda : float
+            Non-negative multiplier for the cost advantage in the policy loss.
 
         Returns
         -------
         dict with mean pg_loss, vf_loss, ent_loss, total_loss across all batches.
         """
-        # Normalise advantages over the entire buffer (reduces variance)
-        adv = buf.advantages
-        buf.advantages = (adv - adv.mean()) / (adv.std() + 1e-8)
-
-        pg_losses, vf_losses, ent_losses = [], [], []
+        pg_losses, reward_vf_losses, cost_vf_losses, ent_losses = [], [], [], []
 
         for _ in range(self.cfg.n_epochs):
-            for (obs_b, act_b, old_lp_b, old_val_b, adv_b, ret_b) in buf.minibatches(
+            for (
+                obs_b,
+                act_b,
+                old_lp_b,
+                _old_val_b,
+                _cost_val_b,
+                reward_adv_b,
+                reward_ret_b,
+                cost_adv_b,
+                cost_ret_b,
+            ) in buf.minibatches(
                 self.cfg.batch_size, self.device, self.rng
             ):
-                _, new_lp, entropy, new_val = self.ac.get_action_and_value(obs_b, act_b)
+                _, new_lp, entropy, new_reward_val, new_cost_val = self.ac.get_action_and_value(obs_b, act_b)
 
                 # --- Clipped surrogate (actor) ---
                 log_ratio   = new_lp - old_lp_b
                 ratio       = log_ratio.exp()
-                pg_loss1    = -adv_b * ratio
-                pg_loss2    = -adv_b * ratio.clamp(1 - self.cfg.clip_eps, 1 + self.cfg.clip_eps)
+                policy_adv_b = reward_adv_b - lagrange_lambda * cost_adv_b
+                policy_adv_b = (policy_adv_b - policy_adv_b.mean()) / (policy_adv_b.std() + 1e-8)
+                pg_loss1    = -policy_adv_b * ratio
+                pg_loss2    = -policy_adv_b * ratio.clamp(1 - self.cfg.clip_eps, 1 + self.cfg.clip_eps)
                 pg_loss     = torch.max(pg_loss1, pg_loss2).mean()
 
-                # --- Value loss ---
-                vf_loss     = nn.functional.mse_loss(new_val, ret_b)
+                # --- Value losses ---
+                reward_vf_loss = nn.functional.mse_loss(new_reward_val, reward_ret_b)
+                cost_vf_loss   = nn.functional.mse_loss(new_cost_val, cost_ret_b)
 
                 # --- Entropy bonus ---
                 ent_loss    = -entropy.mean()
@@ -384,13 +427,10 @@ class PPOTrainer:
                 # --- Combined loss ---
                 loss = (
                     pg_loss
-                    + self.cfg.vf_coef  * vf_loss
+                    + self.cfg.vf_coef  * reward_vf_loss
+                    + self.cfg.cost_vf_coef * cost_vf_loss
                     + self.cfg.ent_coef * ent_loss
                 )
-
-                # Optional hook (CMDP Lagrange penalty)
-                if extra_loss_fn is not None:
-                    loss = loss + extra_loss_fn(obs_b)
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -398,12 +438,14 @@ class PPOTrainer:
                 self.optimizer.step()
 
                 pg_losses.append(pg_loss.item())
-                vf_losses.append(vf_loss.item())
+                reward_vf_losses.append(reward_vf_loss.item())
+                cost_vf_losses.append(cost_vf_loss.item())
                 ent_losses.append(ent_loss.item())
 
         return {
             "pg_loss":  float(np.mean(pg_losses)),
-            "vf_loss":  float(np.mean(vf_losses)),
+            "reward_vf_loss":  float(np.mean(reward_vf_losses)),
+            "cost_vf_loss":  float(np.mean(cost_vf_losses)),
             "ent_loss": float(np.mean(ent_losses)),
         }
 
@@ -417,7 +459,6 @@ class PPOTrainer:
         n_iterations:   int,
         save_dir:       Path | None = None,
         save_every:     int = 10,
-        extra_loss_fn=None,
         verbose:        bool = True,
     ) -> list[dict]:
         """
@@ -428,7 +469,6 @@ class PPOTrainer:
         env           : gymnasium environment
         n_iterations  : int
         save_dir      : if given, save checkpoints here every save_every iters
-        extra_loss_fn : passed to update() at every iteration
         verbose       : print per-iteration summary
 
         Returns
@@ -449,7 +489,7 @@ class PPOTrainer:
 
         for i in range(1, n_iterations + 1):
             buf, rollout_stats = self.collect_rollout(env)
-            update_stats       = self.update(buf, extra_loss_fn=extra_loss_fn)
+            update_stats       = self.update(buf)
 
             record = {
                 "iteration":          i,
@@ -469,7 +509,7 @@ class PPOTrainer:
                     f" | shaped={rollout_stats['mean_ep_shaped']:+.3f}"
                     f" | coll={rollout_stats['collision_count']}"
                     f" | pg={update_stats['pg_loss']:+.4f}"
-                    f" | vf={update_stats['vf_loss']:.4f}"
+                    f" | rvf={update_stats['reward_vf_loss']:.4f}"
                 )
 
             if save_dir is not None and (i % save_every == 0 or i == n_iterations):

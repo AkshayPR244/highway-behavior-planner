@@ -1,6 +1,7 @@
-"""Shared constants and enums used across the planning stack."""
+"""Shared constants, enums, and typed configs used across the planning stack."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import IntEnum
 
 
@@ -58,9 +59,37 @@ def build_env_config() -> dict:
 
 
 # Safety / eval defaults
-MIN_GAP = 4.0
+MIN_FRONT_GAP_M = 4.0
+MIN_REAR_GAP_M = 4.0
 SAFETY_HORIZON = 6
+SAFETY_PREDICTION_HORIZON_S = 6.0
+SAFETY_PREDICTION_DT_S = 1.0
 ANTICIPATORY_TTC_THRESHOLD = 4.0
+EGO_MAX_ACCELERATION_MPS2 = 2.0
+EGO_EXPECTED_DECELERATION_MPS2 = 2.5
+FRONT_VEHICLE_MAX_BRAKING_MPS2 = 4.0
+REAR_VEHICLE_MAX_ACCELERATION_MPS2 = 2.0
+
+
+@dataclass(frozen=True)
+class SafetyConfig:
+    prediction_horizon_s: float = SAFETY_PREDICTION_HORIZON_S
+    prediction_dt_s: float = SAFETY_PREDICTION_DT_S
+    minimum_front_gap_m: float = MIN_FRONT_GAP_M
+    minimum_rear_gap_m: float = MIN_REAR_GAP_M
+    front_vehicle_max_braking_mps2: float = FRONT_VEHICLE_MAX_BRAKING_MPS2
+    rear_vehicle_max_acceleration_mps2: float = REAR_VEHICLE_MAX_ACCELERATION_MPS2
+    ego_max_acceleration_mps2: float = EGO_MAX_ACCELERATION_MPS2
+    ego_expected_deceleration_mps2: float = EGO_EXPECTED_DECELERATION_MPS2
+
+
+@dataclass(frozen=True)
+class EvaluationConfig:
+    min_success_progress_m: float = 300.0
+    min_success_mean_speed_mps: float = 5.0
+    ttc_thresholds_s: tuple[float, ...] = (1.0, 2.0, 4.0)
+    bootstrap_samples: int = 2000
+    bootstrap_seed: int = 0
 
 # IDM + MOBIL defaults
 IDM_DESIRED_SPEED = 25.0

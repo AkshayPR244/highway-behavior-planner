@@ -342,9 +342,14 @@ class TestIsActionSafe:
             rear_speed_right=rear_speed_right,
         )
 
-    def test_slower_always_safe(self):
-        """SLOWER action is always considered safe — braking never causes front collision."""
+    def test_slower_is_not_always_safe(self):
+        """SLOWER should fail closed when the predicted braking trajectory still collides."""
         state = self._state(front_gap=1.0)  # dangerously small gap
+        assert is_action_safe(state, SLOWER, dt=1.0, horizon=6, min_gap=4.0) is False
+
+    def test_slower_safe_with_large_front_gap(self):
+        """SLOWER remains safe when the braking trajectory still clears the leader."""
+        state = self._state(front_gap=100.0, front_speed=25.0, ego_speed=25.0)
         assert is_action_safe(state, SLOWER, dt=1.0, horizon=6, min_gap=4.0) is True
 
     def test_idle_safe_with_large_front_gap(self):
@@ -419,6 +424,10 @@ class TestIsActionSafe:
         state["front_gap_right"] = 3.0
         state["front_speed_right"] = 0.0
         assert is_action_safe(state, LANE_RIGHT, dt=1.0, horizon=6, min_gap=4.0) is False
+
+    def test_unknown_action_fails_closed(self):
+        state = self._state()
+        assert is_action_safe(state, 99, dt=1.0, horizon=6, min_gap=4.0) is False
 
 
 class TestSafetyFilteredEnv:

@@ -1,12 +1,12 @@
 # Learning-Augmented Highway Planner
 
-A research-grade implementation of a four-phase autonomous driving pipeline on
+A reproducible implementation of a four-phase autonomous driving pipeline on
 [highway-env](https://highway-env.farama.org/): analytical expert → imitation
 learning → inverse reinforcement learning → safety-constrained RL.
 
 Each phase's output feeds the next, forming an end-to-end coherent system that
-can be ablated cleanly. The same nine-metric evaluation suite runs across every
-policy so results are directly comparable.
+can be ablated cleanly. The same evaluation suite runs across every policy so
+results are directly comparable.
 
 ---
 
@@ -23,7 +23,7 @@ IDM Expert
     ▼  Phase 2: Behavioural Cloning + DAgger
 Imitation Policy
     │  fixes compounding errors of pure BC
-    │  DAgger-5: collision 10%, goal 90%
+  │  DAgger-5: collision 10%, survival 90%
     │
     ▼  Phase 3: MaxEnt IRL
 IRL Cost Weights
@@ -33,7 +33,7 @@ IRL Cost Weights
     ▼  Phase 4: PPO + CMDP
 Safety-Constrained RL Policy
   targets collision ≤ 10% via Lagrange multiplier tuning
-       PPO-CMDP: collision 10%, goal 90%, jerk 1.348 m/s³
+  PPO-CMDP: collision 10%, survival 90%, jerk 1.348 m/s³
 ```
 
 ---
@@ -49,7 +49,7 @@ section below.
 | Metric | IDM Expert | DAgger-5 | IRL Policy | PPO-CMDP |
 |---|---|---|---|---|
 | Collision rate | 0.000 | 0.100 | 0.050 | **0.100** |
-| Goal completion | 1.000 | 0.900 | 0.950 | **0.900** |
+| Survival rate | 1.000 | 0.900 | 0.950 | **0.900** |
 | Mean min TTC (s) | 12.63 | 8.60 | ∞ | ∞ |
 | RMS jerk (m/s³) | 5.536 | 5.389 | 0.155 | 1.348 |
 | Ego fault rate | 0.000 | 0.050 | 0.000 | 0.000 |
@@ -65,12 +65,12 @@ selection to promote the non-degenerate checkpoint.
 | IDM Expert | IRL Policy |
 |:---:|:---:|
 | ![IDM Expert](results/idm_demo.gif) | ![IRL Policy](results/irl_demo.gif) |
-| collision 0% · goal 100% | collision 5% · goal 95% |
+| collision 0% · survival 100% | collision 5% · survival 95% |
 
 | PPO-unconstrained | PPO-CMDP |
 |:---:|:---:|
 | ![PPO-unconstrained](results/ppo_unc_demo.gif) | ![PPO-CMDP](results/cmdp_demo.gif) |
-| collision 100% — degenerates | collision 10% · goal 90% |
+| collision 100% — degenerates | collision 10% · survival 90% |
 
 ### Full demo video
 
@@ -277,7 +277,8 @@ These require different fixes. The metric suite separates them.
 | Metric | What it detects |
 |---|---|
 | `collision_rate` | overall safety |
-| `goal_completion` | episode success (anticorrelated with collision) |
+| `survival_rate` | timeout without collision |
+| `success_rate` | timeout without collision and sufficient progress |
 | `mean_min_ttc` | margin during close encounters |
 | `rms_jerk` | ride comfort / aggressive longitudinal control |
 | `fallback_rate` | how often the hard safety filter had to intervene |
@@ -317,15 +318,16 @@ python -m scripts.render_policy --policy idm --episodes 3 --out results/idm_demo
 #### Safety wrapper
 
 The `SafetyWrapper` checks every proposed action before it reaches the
-environment. It forward-projects all vehicle positions over `HORIZON=6`
-steps using constant-velocity kinematics. If any gap falls below
-`MIN_GAP=4.0 m`, the action is replaced with IDM fallback.
+environment. It forward-projects vehicle motion over `HORIZON=6` steps using a
+bounded-acceleration model. If any projected gap falls below the configured
+minimum, the action is rejected and a fallback action is safety-checked before
+it is used.
 
 **Design decision — hard override vs. reward penalty:** A reward penalty
 entangles safety and performance in the gradient signal. A hard override
-cleanly separates *what the policy wants* from *what it is allowed to do*,
-making the fallback rate a clean diagnostic. The CMDP in Phase 4 provides a
-softer, learned safety mechanism; the wrapper remains as a last-resort backstop.
+separates *what the policy wants* from *what it is allowed to do*, making the
+fallback rate a clean diagnostic. The CMDP in Phase 4 provides a learned safety
+constraint; the wrapper remains as a last-resort backstop.
 
 **Horizon derivation:** 300 m stopping distance at 30 m/s = 10 s budget.
 Subtract 1 s reaction time. Use midpoint ≈ 6 s as the lookahead.
@@ -481,13 +483,14 @@ python -m optimizer.weight_viz     # regenerate
 ```
 Shared trunk:    25 → Linear(256) → Tanh → Linear(256) → Tanh
 Actor head:      256 → Linear(5) → Categorical distribution
-Critic head:     256 → Linear(1) → scalar value
+Reward critic:    256 → Linear(1) → scalar V_r(s)
+Cost critic:      256 → Linear(1) → scalar V_c(s)
 ```
 
 The shared trunk is warm-started from the DAgger-5 MLP checkpoint using
 `load_actor_weights_from_mlp()`. Only the trunk and actor head weights
-transfer; the critic head is randomly initialised. This gives PPO a head
-start over random initialisation — the actor already knows how to drive
+transfer; the reward and cost critics are randomly initialised. This gives PPO
+a head start over random initialisation — the actor already knows how to drive
 before RL begins.
 
 #### IRL reward shaping
@@ -503,7 +506,7 @@ r_shaped = (−w · φ(s,a)) / scale   +   α · r_env
   weight magnitude.
 - `α = 0.1` — small env reward blend to preserve the episode-completion
   signal. Without it, the policy only optimises IRL cost and ignores whether
-  the episode ends in a goal or crash.
+  the episode ends in survival or collision.
 
 **Design decision — why divide by std:** Raw IRL weights produce costs with
 arbitrary absolute scale. If `scale` is large, the IRL reward dominates the
@@ -523,6 +526,7 @@ signal to a unit-scale reference.
 | `λ_gae` | 0.95 | low-variance GAE; standard for control tasks |
 | `ent_coef` | 0.01 | small entropy bonus to prevent premature determinism |
 | `vf_coef` | 0.5 | standard value loss weight |
+| `cost_vf_coef` | 0.5 | cost critic loss weight for CMDP |
 
 #### Why PPO-unconstrained fails
 
@@ -544,6 +548,9 @@ The Lagrangian objective is:
 L(π, λ) = E[r_shaped] − λ · (collision_rate − ε)
 ```
 
+The actor uses the lagrangian advantage $A_r - \lambda A_c$, while the reward
+and cost critics are trained on their own returns.
+
 The dual update per iteration:
 
 ```
@@ -561,7 +568,7 @@ The dual update per iteration:
 **Observed λ trajectory:** λ rises from 0 to ~0.22 in iterations 1–5 as the
 policy crashes frequently. It then decays to ~0.15 as the policy learns to
 avoid collisions. The final λ=0.149 indicates the constraint is binding (the
-policy sits at exactly the ε boundary), which is the expected saddle-point
+policy sits near the ε boundary), which is the expected saddle-point
 behaviour.
 
 #### PPO-unconstrained vs PPO-CMDP

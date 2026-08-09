@@ -141,7 +141,12 @@ def _select_best_checkpoint(
 
     best_ckpt, best_metrics = min(
         scored,
-        key=lambda item: (item[1].collision_rate, -item[1].goal_completion),
+        key=lambda item: (
+            item[1].collision_rate,
+            -item[1].success_rate,
+            -item[1].mean_longitudinal_progress,
+            item[1].rms_jerk,
+        ),
     )
     return best_ckpt, best_metrics
 
@@ -439,7 +444,8 @@ def main() -> None:
             print(
                 "Selected best unconstrained checkpoint "
                 f"{best_ckpt.name} (collision={best_metrics.collision_rate:.3f}, "
-                f"goal={best_metrics.goal_completion:.3f})"
+                f"survival={best_metrics.survival_rate:.3f}, "
+                f"success={best_metrics.success_rate:.3f})"
             )
 
     if not args.unconstrained_only:
@@ -469,7 +475,8 @@ def main() -> None:
             print(
                 "Selected best CMDP checkpoint "
                 f"{best_ckpt.name} (collision={best_metrics.collision_rate:.3f}, "
-                f"goal={best_metrics.goal_completion:.3f})"
+                f"survival={best_metrics.survival_rate:.3f}, "
+                f"success={best_metrics.success_rate:.3f})"
             )
 
     comparison_results = print_comparison(

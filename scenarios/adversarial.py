@@ -323,18 +323,37 @@ def run_scenario(
     nan      = float("nan")
     min_ttcs = [min(s.ttcs) for s in all_stats if s.ttcs]
     rms_jerks= [_compute_jerk(s.speeds, dt) for s in all_stats]
+    episode_speeds = [float(np.mean(s.speeds)) for s in all_stats if s.speeds]
+    episode_distances = [float(np.sum(s.speeds) * dt) for s in all_stats]
+    episode_progress = [float(s.speeds[-1] * s.n_steps * dt) if s.speeds else 0.0 for s in all_stats]
+    finite_ttcs = [ttc for s in all_stats for ttc in s.ttcs if np.isfinite(ttc)]
+    survival_rate = 1.0 - (n_col / n_episodes)
+    success_rate = sum(
+        1.0
+        for s in all_stats
+        if not s.collision and float(np.mean(s.speeds)) >= 5.0 and float(np.sum(s.speeds) * dt) >= 300.0
+    ) / n_episodes if n_episodes else 0.0
 
     return EvalResults(
         collision_rate     = n_col / n_episodes,
         mean_min_ttc       = float(np.mean(min_ttcs)) if min_ttcs else np.inf,
         rms_jerk           = float(np.mean(rms_jerks)),
-        goal_completion    = 1.0 - n_col / n_episodes,
+        survival_rate      = survival_rate,
+        success_rate       = success_rate,
         fallback_rate      = n_fb  / n_steps if n_steps else 0.0,
         lc_frequency       = n_lci / n_steps if n_steps else 0.0,
         lc_completion_rate = n_lcc / n_lci   if n_lci   else nan,
         lc_anticipatory_frac = n_lca / n_lci if n_lci   else nan,
         ego_fault_rate     = n_ego / n_episodes,
         npc_fault_rate     = n_npc / n_episodes,
+        mean_distance_travelled = float(np.mean(episode_distances)) if episode_distances else 0.0,
+        mean_longitudinal_progress = float(np.mean(episode_progress)) if episode_progress else 0.0,
+        mean_speed = float(np.mean(episode_speeds)) if episode_speeds else 0.0,
+        mean_episode_duration = float(np.mean([s.n_steps * dt for s in all_stats])) if all_stats else 0.0,
+        ttc_below_1s_frac = float(np.mean([ttc < 1.0 for ttc in finite_ttcs])) if finite_ttcs else 0.0,
+        ttc_below_2s_frac = float(np.mean([ttc < 2.0 for ttc in finite_ttcs])) if finite_ttcs else 0.0,
+        ttc_below_4s_frac = float(np.mean([ttc < 4.0 for ttc in finite_ttcs])) if finite_ttcs else 0.0,
+        ttc_p5_finite = float(np.percentile(finite_ttcs, 5.0)) if finite_ttcs else np.inf,
         n_episodes         = n_episodes,
         n_steps_total      = n_steps,
     )
@@ -376,7 +395,8 @@ def print_scenario_comparison(results: dict[str, EvalResults]) -> None:
 
     metric_rows: list[tuple[str, Callable]] = [
         ("Collision rate",        lambda r: f"{r.collision_rate:.3f}"),
-        ("Goal completion",       lambda r: f"{r.goal_completion:.3f}"),
+        ("Survival rate",         lambda r: f"{r.survival_rate:.3f}"),
+        ("Success rate",          lambda r: f"{r.success_rate:.3f}"),
         ("Mean min TTC (s)",      lambda r: f"{r.mean_min_ttc:.2f}"),
         ("RMS jerk (m/s³)",       lambda r: f"{r.rms_jerk:.3f}"),
         ("Fallback rate",         lambda r: f"{r.fallback_rate:.3f}"),

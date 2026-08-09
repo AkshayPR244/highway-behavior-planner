@@ -65,37 +65,40 @@ class TestActorCriticShape:
     def test_forward_dist_and_value_shape(self):
         ac  = _make_ac()
         obs = torch.zeros(4, OBS_DIM)   # batch of 4
-        dist, value = ac.forward(obs)
-        assert value.shape == (4,), f"value shape: {value.shape}"
+        dist, reward_value, cost_value = ac.forward(obs)
+        assert reward_value.shape == (4,), f"reward_value shape: {reward_value.shape}"
+        assert cost_value.shape == (4,), f"cost_value shape: {cost_value.shape}"
         assert dist.probs.shape == (4, N_ACTIONS)
 
     def test_get_action_and_value_shapes(self):
         ac  = _make_ac()
         obs = torch.zeros(8, OBS_DIM)
-        action, lp, entropy, value = ac.get_action_and_value(obs)
+        action, lp, entropy, reward_value, cost_value = ac.get_action_and_value(obs)
         assert action.shape   == (8,)
         assert lp.shape       == (8,)
         assert entropy.shape  == (8,)
-        assert value.shape    == (8,)
+        assert reward_value.shape == (8,)
+        assert cost_value.shape   == (8,)
 
     def test_get_action_and_value_with_given_action(self):
         ac     = _make_ac()
         obs    = torch.zeros(4, OBS_DIM)
         acts   = torch.zeros(4, dtype=torch.long)
-        _, lp, entropy, value = ac.get_action_and_value(obs, acts)
+        _, lp, entropy, reward_value, cost_value = ac.get_action_and_value(obs, acts)
         assert lp.shape == (4,)
 
     def test_logprob_is_finite(self):
         ac  = _make_ac(42)
         obs = torch.rand(16, OBS_DIM)
-        _, lp, _, _ = ac.get_action_and_value(obs)
+        _, lp, _, _, _ = ac.get_action_and_value(obs)
         assert torch.all(torch.isfinite(lp))
 
     def test_value_is_finite(self):
         ac  = _make_ac(1)
         obs = torch.rand(8, OBS_DIM)
-        _, _, _, value = ac.get_action_and_value(obs)
-        assert torch.all(torch.isfinite(value))
+        _, _, _, reward_value, cost_value = ac.get_action_and_value(obs)
+        assert torch.all(torch.isfinite(reward_value))
+        assert torch.all(torch.isfinite(cost_value))
 
 
 # ---------------------------------------------------------------------------
@@ -145,9 +148,10 @@ class TestActorCriticSaveLoad:
         ac2 = ActorCritic.load(p)
         obs = torch.rand(2, OBS_DIM)
         with torch.no_grad():
-            _, v1 = ac.forward(obs)
-            _, v2 = ac2.forward(obs)
-        torch.testing.assert_close(v1, v2)
+            _, reward_v1, cost_v1 = ac.forward(obs)
+            _, reward_v2, cost_v2 = ac2.forward(obs)
+        torch.testing.assert_close(reward_v1, reward_v2)
+        torch.testing.assert_close(cost_v1, cost_v2)
 
     def test_load_produces_valid_actions(self, tmp_path):
         ac = _make_ac(88)
@@ -211,13 +215,17 @@ class TestRolloutBuffer:
 
     def test_returns_shape(self):
         buf = self._make_buffer(20)
-        assert buf.returns.shape    == (20,)
-        assert buf.advantages.shape == (20,)
+        assert buf.reward_returns.shape    == (20,)
+        assert buf.reward_advantages.shape == (20,)
+        assert buf.cost_returns.shape      == (20,)
+        assert buf.cost_advantages.shape   == (20,)
 
     def test_returns_finite(self):
         buf = self._make_buffer(32)
-        assert torch.all(torch.isfinite(buf.returns))
-        assert torch.all(torch.isfinite(buf.advantages))
+        assert torch.all(torch.isfinite(buf.reward_returns))
+        assert torch.all(torch.isfinite(buf.reward_advantages))
+        assert torch.all(torch.isfinite(buf.cost_returns))
+        assert torch.all(torch.isfinite(buf.cost_advantages))
 
     def test_minibatches_cover_all_data(self):
         T   = 32
@@ -246,15 +254,16 @@ class TestRolloutBuffer:
         buf.compute_returns(last_value=0.5, gamma=0.99, gae_lambda=0.95,
                             device=torch.device("cpu"))
         # Advantage at t=4 (terminal) should reflect no future value bleed
-        assert buf.advantages is not None
+        assert buf.reward_advantages is not None
 
     def test_to_tensors_shapes(self):
         buf = self._make_buffer(16)
-        obs_t, act_t, lp_t, val_t = buf.to_tensors(torch.device("cpu"))
+        obs_t, act_t, lp_t, val_t, cost_val_t = buf.to_tensors(torch.device("cpu"))
         assert obs_t.shape == (16, OBS_DIM)
         assert act_t.shape == (16,)
         assert lp_t.shape  == (16,)
         assert val_t.shape == (16,)
+        assert cost_val_t.shape == (16,)
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +285,7 @@ class TestGAEAdvantageMath:
         buf.compute_returns(last_value=2.0, gamma=0.99, gae_lambda=0.0,
                             device=torch.device("cpu"))
         expected = 1.0 + 0.99 * 2.0 - 1.0   # = 1.98
-        assert abs(buf.advantages[0].item() - expected) < 1e-4
+        assert abs(buf.reward_advantages[0].item() - expected) < 1e-4
 
     def test_terminal_step_no_bootstrap(self):
         """
@@ -290,7 +299,7 @@ class TestGAEAdvantageMath:
                             device=torch.device("cpu"))
         # done=True zeroes the (1 - done) mask → no bootstrap
         expected = 3.0 - 1.0   # = 2.0
-        assert abs(buf.advantages[0].item() - expected) < 1e-4
+        assert abs(buf.reward_advantages[0].item() - expected) < 1e-4
 
 
 # ---------------------------------------------------------------------------
@@ -382,15 +391,19 @@ class TestLagrangeUpdate:
 
         captured = {}
 
-        def _fake_update(_buf):
+        def _fake_update(_buf, lagrange_lambda=0.0):
             captured["rewards"] = list(_buf.rewards)
-            return {"pg_loss": 0.0, "vf_loss": 0.0, "ent_loss": 0.0}
+            captured["costs"] = list(_buf.costs)
+            captured["lambda"] = lagrange_lambda
+            return {"pg_loss": 0.0, "reward_vf_loss": 0.0, "cost_vf_loss": 0.0, "ent_loss": 0.0}
 
         monkeypatch.setattr(trainer.ppo, "collect_rollout", _fake_collect_rollout)
         monkeypatch.setattr(trainer.ppo, "update", _fake_update)
 
         trainer.train(env=None, n_iterations=1, verbose=False)
-        assert captured["rewards"] == [1.0, -1.0]
+        assert captured["rewards"] == [1.0, 1.0]
+        assert captured["costs"] == [0.0, 1.0]
+        assert captured["lambda"] == pytest.approx(2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -466,7 +479,8 @@ class TestPPOTrainerUpdate:
         buf     = self._synthetic_buffer(64)
         stats   = trainer.update(buf)
         assert "pg_loss"  in stats
-        assert "vf_loss"  in stats
+        assert "reward_vf_loss" in stats
+        assert "cost_vf_loss" in stats
         assert "ent_loss" in stats
 
     def test_update_stats_finite(self):
@@ -476,7 +490,8 @@ class TestPPOTrainerUpdate:
         buf     = self._synthetic_buffer(64)
         stats   = trainer.update(buf)
         assert np.isfinite(stats["pg_loss"])
-        assert np.isfinite(stats["vf_loss"])
+        assert np.isfinite(stats["reward_vf_loss"])
+        assert np.isfinite(stats["cost_vf_loss"])
         assert np.isfinite(stats["ent_loss"])
 
     def test_update_changes_weights(self):

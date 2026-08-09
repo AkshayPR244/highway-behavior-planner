@@ -1,51 +1,13 @@
-"""
-SafetyWrapper — predictive safety heuristic for any policy on highway-v0.
+"""SafetyWrapper — conservative bounded-acceleration safety filtering.
 
-Architecture
-------------
-The wrapper sits between the policy and the environment.  On each step:
+The wrapper sits between the policy and the environment. It validates the
+proposed action against a bounded-acceleration forward model, fails closed on
+unknown or malformed state, and only falls back to another action after that
+fallback has also been safety-checked.
 
-  1. Query the inner policy for a proposed action.
-  2. Run a constant-velocity forward projection for `horizon` policy steps
-     (default 3 s at 1 Hz policy frequency).
-  3. Check two safety conditions at every projected step:
-       a) Front gap in the ego's current/target lane >= MIN_GAP
-       b) For lane changes: rear gap in the target lane >= MIN_GAP (merge safety)
-  4. If either condition fails → override with the IDM expert's action.
-  5. Pass `info["fallback"] = True` back to the caller when an override fires.
-
-The IDM fallback is intentionally conservative: it will brake or hold lane
-rather than attempt a marginal manoeuvre.  The filter enforces a guarantee
-only with respect to its forward-projection model (not full collision
-avoidance under all dynamics).
-
-Note on `info` propagation
---------------------------
-gymnasium's env.step() returns a fixed info dict.  The wrapper calls
-env.step(action) and then injects the `fallback` key into the returned dict,
-so the evaluator's fallback_rate metric works without any env modification.
-
-Usage
------
-    from envs.highway_wrapper import make_env
-    from policies.idm_expert import IDMExpert
-    from safety.safety_wrapper import SafetyWrapper
-
-    env   = make_env()
-    inner = SomeLearnedPolicy(...)
-    safe  = SafetyWrapper(inner, env)
-
-    obs, _ = env.reset()
-    while True:
-        action, info_extras = safe.act_with_info(obs)
-        obs, reward, terminated, truncated, info = env.step(action)
-        info.update(info_extras)   # injects "fallback" key
-
-The evaluator calls policy.act(obs) and separately inspects info["fallback"],
-so SafetyWrapper also exposes a plain .act(obs) -> int interface; in that
-mode the evaluator picks up fallback from the info dict injected by the
-wrapper's companion env-stepping helper.  See SafetyFilteredEnv below for the
-recommended integration pattern.
+Lane-change safety is evaluated against both current-lane and target-lane
+front/rear interactions so the filter does not treat lateral manoeuvres as
+purely one-dimensional decisions.
 """
 from __future__ import annotations
 
@@ -53,7 +15,18 @@ import numpy as np
 import gymnasium as gym
 from typing import Protocol
 
-from config.settings import BehaviorAction, MIN_GAP, SAFETY_HORIZON
+from config.settings import (
+    BehaviorAction,
+    EGO_EXPECTED_DECELERATION_MPS2,
+    EGO_MAX_ACCELERATION_MPS2,
+    FRONT_VEHICLE_MAX_BRAKING_MPS2,
+    MIN_FRONT_GAP_M,
+    MIN_REAR_GAP_M,
+    REAR_VEHICLE_MAX_ACCELERATION_MPS2,
+    SAFETY_HORIZON,
+    SAFETY_PREDICTION_DT_S,
+    SafetyConfig,
+)
 
 # Backward-compatible aliases exported for tests/importers.
 HORIZON = SAFETY_HORIZON
@@ -62,6 +35,7 @@ IDLE = int(BehaviorAction.IDLE)
 LANE_RIGHT = int(BehaviorAction.LANE_RIGHT)
 FASTER = int(BehaviorAction.FASTER)
 SLOWER = int(BehaviorAction.SLOWER)
+_VALID_ACTIONS = frozenset({LANE_LEFT, IDLE, LANE_RIGHT, FASTER, SLOWER})
 
 
 # ---------------------------------------------------------------------------
@@ -95,10 +69,14 @@ def _get_road_state(env: gym.Env) -> dict:
     front_gap_right: float, gap to front vehicle in right lane (m), inf if none
     front_speed_right: float, speed of right-lane front vehicle, ego_speed if none
     """
-    road = env.unwrapped.road
-    ego  = env.unwrapped.vehicle
-    n_lanes = env.unwrapped.config.get("lanes_count", 3)
-    ego_lane: int = ego.lane_index[2]
+    try:
+        road = env.unwrapped.road
+        ego  = env.unwrapped.vehicle
+        n_lanes = env.unwrapped.config.get("lanes_count", 3)
+        ego_lane: int = ego.lane_index[2]
+        ego_speed = float(ego.speed)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return {}
 
     # Front vehicle in current lane. If road queries fail, mark unknown as unsafe.
     try:
@@ -107,8 +85,7 @@ def _get_road_state(env: gym.Env) -> dict:
         front_gap   = ego.lane_distance_to(front) if front is not None else np.inf
         front_speed = front.speed if front is not None else ego.speed
     except (AttributeError, IndexError, TypeError, ValueError):
-        front_gap = 0.0
-        front_speed = 0.0
+        return {}
 
     # Rear vehicle in left lane (lane_index - 1)
     rear_left_gap, rear_left_speed = _lane_rear_gap(road, ego, ego_lane - 1)
@@ -121,7 +98,7 @@ def _get_road_state(env: gym.Env) -> dict:
     front_right_gap, front_right_speed = _lane_front_gap(road, ego, ego_lane + 1)
 
     return dict(
-        ego_speed=ego.speed,
+        ego_speed=ego_speed,
         ego_lane=ego_lane,
         n_lanes=n_lanes,
         front_gap=front_gap,
@@ -162,8 +139,7 @@ def _lane_rear_gap(road, ego, target_lane_idx: int) -> tuple[float, float]:
         gap = ego_s - closest_rear.position[0]
         return max(0.0, gap), closest_rear.speed
     except (AttributeError, IndexError, TypeError, ValueError):
-        # Unknown rear state should fail closed (unsafe lane change).
-        return 0.0, np.inf
+        return np.inf, np.nan
 
 
 def _lane_front_gap(road, ego, target_lane_idx: int) -> tuple[float, float]:
@@ -191,8 +167,7 @@ def _lane_front_gap(road, ego, target_lane_idx: int) -> tuple[float, float]:
         gap = closest_front.position[0] - ego_s
         return max(0.0, gap), closest_front.speed
     except (AttributeError, IndexError, TypeError, ValueError):
-        # Unknown front state should fail closed (unsafe forward/merge action).
-        return 0.0, 0.0
+        return np.inf, np.nan
 
 
 def _project_front_gap(
@@ -201,6 +176,8 @@ def _project_front_gap(
     front_speed: float,
     dt: float,
     horizon: int,
+    ego_accel: float = 0.0,
+    front_accel: float = 0.0,
 ) -> float:
     """
     Project the front gap forward using a constant-velocity model.
@@ -212,7 +189,9 @@ def _project_front_gap(
     gap = front_gap
     min_gap = gap
     for _ in range(horizon):
-        gap += (front_speed - ego_speed) * dt
+        gap += (front_speed - ego_speed) * dt + 0.5 * (front_accel - ego_accel) * dt * dt
+        ego_speed += ego_accel * dt
+        front_speed += front_accel * dt
         min_gap = min(min_gap, gap)
     return min_gap
 
@@ -223,6 +202,8 @@ def _project_rear_gap(
     rear_speed: float,
     dt: float,
     horizon: int,
+    ego_accel: float = 0.0,
+    rear_accel: float = 0.0,
 ) -> float:
     """
     Project the gap from the rear vehicle to the ego (in target lane after merge).
@@ -235,8 +216,9 @@ def _project_rear_gap(
     gap = rear_gap
     min_gap = gap
     for _ in range(horizon):
-        # Rear vehicle closes on ego if it's faster
-        gap += (ego_speed - rear_speed) * dt
+        gap += (ego_speed - rear_speed) * dt + 0.5 * (ego_accel - rear_accel) * dt * dt
+        ego_speed += ego_accel * dt
+        rear_speed += rear_accel * dt
         min_gap = min(min_gap, gap)
     return min_gap
 
@@ -245,7 +227,14 @@ def _project_rear_gap(
 # Safety predicate
 # ---------------------------------------------------------------------------
 
-def is_action_safe(state: dict, action: int, dt: float, horizon: int, min_gap: float) -> bool:
+def is_action_safe(
+    state: dict,
+    action: int,
+    dt: float,
+    horizon: int,
+    min_gap: float,
+    safety_config: SafetyConfig | None = None,
+) -> bool:
     """
     Return True if `action` passes the forward-projection safety check.
 
@@ -256,56 +245,111 @@ def is_action_safe(state: dict, action: int, dt: float, horizon: int, min_gap: f
       rear vehicle in the target lane must also stay >= min_gap post-merge.
     - SLOWER: always safe from a collision standpoint (increases front gap).
     """
-    ego_speed   = state["ego_speed"]
-    ego_lane    = state["ego_lane"]
-    n_lanes     = state["n_lanes"]
-    front_gap   = state["front_gap"]
-    front_speed = state["front_speed"]
+    cfg = safety_config or SafetyConfig()
 
-    if action == SLOWER:
-        return True
+    if action not in _VALID_ACTIONS:
+        return False
+
+    required = ["ego_speed", "ego_lane", "n_lanes", "front_gap", "front_speed"]
+    if not state or any(key not in state for key in required):
+        return False
+
+    ego_speed = float(state["ego_speed"])
+    ego_lane = int(state["ego_lane"])
+    n_lanes = int(state["n_lanes"])
+    front_gap = float(state["front_gap"])
+    front_speed = float(state["front_speed"])
+
+    if not np.isfinite([ego_speed, front_speed]).all() or np.isnan(front_gap):
+        return False
+
+    front_brake = -abs(cfg.front_vehicle_max_braking_mps2)
+    rear_accel = abs(cfg.rear_vehicle_max_acceleration_mps2)
 
     if action in (IDLE, FASTER):
-        # Conservative: assume FASTER raises ego speed by 1 m/s
-        effective_speed = ego_speed + (1.0 if action == FASTER else 0.0)
-        proj = _project_front_gap(front_gap, effective_speed, front_speed, dt, horizon)
+        ego_accel = 0.0 if action == IDLE else abs(cfg.ego_max_acceleration_mps2)
+        proj = _project_front_gap(
+            front_gap,
+            ego_speed,
+            front_speed,
+            dt,
+            horizon,
+            ego_accel=ego_accel,
+            front_accel=front_brake,
+        )
+        return proj >= min_gap
+
+    if action == SLOWER:
+        proj = _project_front_gap(
+            front_gap,
+            ego_speed,
+            front_speed,
+            dt,
+            horizon,
+            ego_accel=-abs(cfg.ego_expected_deceleration_mps2),
+            front_accel=front_brake,
+        )
         return proj >= min_gap
 
     if action == LANE_LEFT:
         if ego_lane == 0:
-            return False  # already in leftmost lane — action is a no-op but flag it
+            return False
         rear_gap   = state["rear_gap_left"]
         rear_speed = state["rear_speed_left"]
         front_gap_target = state.get("front_gap_left", front_gap)
         front_speed_target = state.get("front_speed_left", front_speed)
-        proj_rear = _project_rear_gap(rear_gap, ego_speed, rear_speed, dt, horizon)
+        if not np.isfinite([rear_gap, rear_speed, front_speed_target]).all() or np.isnan(front_gap_target):
+            return False
+        proj_rear = _project_rear_gap(
+            rear_gap,
+            ego_speed,
+            rear_speed,
+            dt,
+            horizon,
+            ego_accel=0.0,
+            rear_accel=rear_accel,
+        )
         proj_front = _project_front_gap(
             front_gap_target,
             ego_speed,
             front_speed_target,
             dt,
             horizon,
+            ego_accel=0.0,
+            front_accel=front_brake,
         )
         return proj_rear >= min_gap and proj_front >= min_gap
 
     if action == LANE_RIGHT:
         if ego_lane >= n_lanes - 1:
-            return False  # already in rightmost lane
+            return False
         rear_gap   = state["rear_gap_right"]
         rear_speed = state["rear_speed_right"]
         front_gap_target = state.get("front_gap_right", front_gap)
         front_speed_target = state.get("front_speed_right", front_speed)
-        proj_rear = _project_rear_gap(rear_gap, ego_speed, rear_speed, dt, horizon)
+        if not np.isfinite([rear_gap, rear_speed, front_speed_target]).all() or np.isnan(front_gap_target):
+            return False
+        proj_rear = _project_rear_gap(
+            rear_gap,
+            ego_speed,
+            rear_speed,
+            dt,
+            horizon,
+            ego_accel=0.0,
+            rear_accel=rear_accel,
+        )
         proj_front = _project_front_gap(
             front_gap_target,
             ego_speed,
             front_speed_target,
             dt,
             horizon,
+            ego_accel=0.0,
+            front_accel=front_brake,
         )
         return proj_rear >= min_gap and proj_front >= min_gap
 
-    return True  # unknown action — pass through
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -336,12 +380,18 @@ class SafetyWrapper:
         env: gym.Env,
         fallback_policy: Policy | None = None,
         horizon: int = HORIZON,
-        min_gap: float = MIN_GAP,
+        min_gap: float = MIN_FRONT_GAP_M,
     ) -> None:
         self.inner    = inner
         self.env      = env
         self.horizon  = horizon
         self.min_gap  = min_gap
+        self.config   = SafetyConfig(
+            prediction_horizon_s=float(horizon),
+            prediction_dt_s=float(env.unwrapped.config.get("policy_frequency", 1) ** -1),
+            minimum_front_gap_m=float(min_gap),
+            minimum_rear_gap_m=float(MIN_REAR_GAP_M),
+        )
 
         if fallback_policy is None:
             from policies.idm_expert import IDMExpert
@@ -351,6 +401,14 @@ class SafetyWrapper:
 
         policy_freq = env.unwrapped.config.get("policy_frequency", 1)
         self.dt = 1.0 / policy_freq
+
+    def _fallback_candidates(self, proposed_action: int, fallback_action: int) -> list[int]:
+        ordered = [fallback_action, SLOWER, IDLE, LANE_LEFT, LANE_RIGHT, FASTER]
+        result: list[int] = []
+        for candidate in [proposed_action, *ordered]:
+            if candidate not in result:
+                result.append(candidate)
+        return result
 
     # ------------------------------------------------------------------
     # Core interface
@@ -374,11 +432,25 @@ class SafetyWrapper:
         compatible with the gymnasium step(action) contract.
         """
         state = _get_road_state(self.env)
-        if is_action_safe(state, proposed_action, self.dt, self.horizon, self.min_gap):
-            return proposed_action, {"fallback": False}
+        if is_action_safe(state, proposed_action, self.dt, self.horizon, self.min_gap, self.config):
+            return proposed_action, {"fallback": False, "safety_checked": True, "fallback_safe": True}
 
-        safe_action = self.fallback.act(obs)
-        return safe_action, {"fallback": True}
+        fallback_action = self.fallback.act(obs)
+        telemetry = {
+            "fallback": True,
+            "safety_checked": True,
+            "proposed_action_safe": False,
+            "fallback_action": int(fallback_action),
+        }
+        for candidate in self._fallback_candidates(proposed_action, int(fallback_action)):
+            if is_action_safe(state, candidate, self.dt, self.horizon, self.min_gap, self.config):
+                telemetry["fallback_safe"] = True
+                telemetry["selected_action"] = int(candidate)
+                return int(candidate), telemetry
+
+        telemetry["fallback_safe"] = False
+        telemetry["selected_action"] = int(SLOWER)
+        return int(SLOWER), telemetry
 
     def act_with_info(self, obs: np.ndarray) -> tuple[int, dict]:
         """
@@ -425,7 +497,7 @@ class SafetyFilteredEnv(gym.Wrapper):
         inner: Policy,
         fallback_policy: Policy | None = None,
         horizon: int = HORIZON,
-        min_gap: float = MIN_GAP,
+        min_gap: float = MIN_FRONT_GAP_M,
     ) -> None:
         super().__init__(env)
         self._last_obs: np.ndarray | None = None
