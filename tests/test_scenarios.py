@@ -37,10 +37,10 @@ class TestSuddenBrake:
     IDM should escape more than half the time via braking or lane change.
     """
 
-    def test_goal_completion_above_threshold(self, idm_scenario_results):
+    def test_survival_rate_above_threshold(self, idm_scenario_results):
         r = idm_scenario_results["sudden_brake"]
-        assert r.goal_completion >= 0.4, (
-            f"IDM should complete ≥40% of sudden_brake episodes, got {r.goal_completion:.2f}"
+        assert r.survival_rate >= 0.4, (
+            f"IDM should survive ≥40% of sudden_brake episodes, got {r.survival_rate:.2f}"
         )
 
     def test_ego_fault_rate_bounded(self, idm_scenario_results):
@@ -64,10 +64,10 @@ class TestCloseMerge:
     IDM+MOBIL safety criterion should prevent the collision in most episodes.
     """
 
-    def test_goal_completion_high(self, idm_scenario_results):
+    def test_survival_rate_high(self, idm_scenario_results):
         r = idm_scenario_results["close_merge"]
-        assert r.goal_completion >= 0.6, (
-            f"IDM should handle close_merge in ≥60% of episodes, got {r.goal_completion:.2f}"
+        assert r.survival_rate >= 0.6, (
+            f"IDM should handle close_merge in ≥60% of episodes, got {r.survival_rate:.2f}"
         )
 
     def test_ego_fault_zero_or_low(self, idm_scenario_results):
@@ -114,11 +114,11 @@ class TestDenseCorridor:
     IDM should escape in most episodes by changing lanes early.
     """
 
-    def test_goal_completion_above_threshold(self, idm_scenario_results):
+    def test_survival_rate_above_threshold(self, idm_scenario_results):
         r = idm_scenario_results["dense_corridor"]
-        assert r.goal_completion >= 0.6, (
+        assert r.survival_rate >= 0.6, (
             f"IDM should navigate dense_corridor in ≥60% of episodes, "
-            f"got {r.goal_completion:.2f}"
+            f"got {r.survival_rate:.2f}"
         )
 
     def test_lc_frequency_elevated(self, idm_scenario_results):

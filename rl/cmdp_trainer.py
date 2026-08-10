@@ -169,36 +169,44 @@ class CMDPTrainer:
             # ---- 1. Collect rollout ----
             buf, rollout_stats = self.ppo.collect_rollout(env)
 
-            n_steps = len(buf.rewards)
-            collision_rate = (
-                rollout_stats["collision_count"] / max(rollout_stats["episodes"], 1)
-            )
+            completed_episodes = int(rollout_stats["episodes"])
+            if completed_episodes > 0:
+                collision_rate = rollout_stats["collision_count"] / completed_episodes
+                lambda_updated = True
+            else:
+                collision_rate = float("nan")
+                lambda_updated = False
 
             # ---- 2. PPO-Lagrangian update ----
             update_stats = self.ppo.update(buf, lagrange_lambda=self._lambda)
 
             # ---- 3. Update λ ----
-            self._update_lambda(collision_rate)
+            if lambda_updated:
+                self._update_lambda(collision_rate)
             self.lambda_history.append(self._lambda)
             self.collision_history.append(collision_rate)
 
             record = {
                 "iteration":       i,
                 "episodes":        rollout_stats["episodes"],
+                "completed_episodes": completed_episodes,
                 "mean_ep_ret":     rollout_stats["mean_ep_ret"],
                 "mean_ep_shaped":  rollout_stats["mean_ep_shaped"],
                 "collision_rate":  collision_rate,
+                "lambda_updated":   lambda_updated,
                 "lambda":          self._lambda,
                 **update_stats,
             }
             self.ppo.history.append(record)
 
             if verbose and (i % 5 == 0 or i == 1):
+                collision_text = f"{collision_rate:.3f}" if lambda_updated else "unavailable"
                 print(
                     f"  iter {i:4d}/{n_iterations}"
                     f" | eps={rollout_stats['episodes']:3d}"
                     f" | ret={rollout_stats['mean_ep_ret']:+.3f}"
-                    f" | coll={collision_rate:.3f}"
+                    f" | coll={collision_text}"
+                    f" | λ_upd={lambda_updated}"
                     f" | λ={self._lambda:.4f}"
                     f" | pg={update_stats['pg_loss']:+.4f}"
                 )

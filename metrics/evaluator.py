@@ -1,29 +1,8 @@
-"""
-Metric suite for evaluating any policy on highway-v0.
+"""Metric suite for evaluating policies on highway-v0.
 
-Metrics collected per episode, then aggregated across episodes:
-
-    collision_rate      — fraction of episodes ending in collision (safety)
-    mean_min_ttc        — mean of per-episode minimum TTC in seconds (safety margin)
-    rms_jerk            — RMS longitudinal jerk in m/s^3 (comfort)
-    survival_rate       — fraction of episodes reaching timeout without collision
-    success_rate        — fraction of episodes that survive and make adequate progress
-  fallback_rate       — fraction of steps where the safety wrapper overrode the policy
-  lc_frequency        — lane-change initiations per step (lateral activity)
-  lc_completion_rate  — fraction of initiated lane changes where ego reached the new lane
-  lc_anticipatory_frac— fraction of LCs issued while closing on a slow vehicle with TTC > threshold
-                        (anticipatory = acting before forced; reactive = acting under pressure)
-  ego_fault_rate      — fraction of episodes where a collision was caused by ego's action
-  npc_fault_rate      — fraction of episodes where a collision was unavoidable (NPC at fault)
-
-Usage:
-    from metrics.evaluator import evaluate
-    from policies.idm_expert import IDMExpert
-    from envs.highway_wrapper import make_env
-
-    env = make_env()
-    results = evaluate(policy=IDMExpert(env), env=env, n_episodes=20)
-    print_table(results)
+Metrics are collected per episode, then aggregated across episodes.
+This module keeps collision, survival, and mission success semantics distinct,
+and reports TTC risk as exposure over valid TTC samples.
 """
 from __future__ import annotations
 
@@ -41,49 +20,76 @@ from metrics.fault_attribution import snapshot_pre_step, classify_fault
 # Data structures
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class EpisodeStats:
     """Raw per-step data collected during one episode."""
-    speeds: list[float] = field(default_factory=list)       # ego speed each step (m/s)
-    ttcs: list[float] = field(default_factory=list)         # TTC each step (s), inf if no vehicle ahead
+
+    speeds: list[float] = field(default_factory=list)
+    ttcs: list[float] = field(default_factory=list)
     distance_travelled: float = 0.0
     longitudinal_progress: float = 0.0
     duration_s: float = 0.0
     collision: bool = False
-    n_fallbacks: int = 0                                     # steps where safety wrapper fired
+    n_fallbacks: int = 0
     n_steps: int = 0
-    n_lc_initiated: int = 0      # steps where policy issued LANE_LEFT or LANE_RIGHT
-    n_lc_completed: int = 0      # steps where ego's integer lane number actually changed
-    n_lc_anticipatory: int = 0   # LCs issued while closing on front vehicle with TTC > threshold
-    fault: str = "none"           # "none" | "ego" | "npc" | "ambiguous" (set on crash)
+    n_lc_initiated: int = 0
+    n_lc_completed: int = 0
+    n_lc_anticipatory: int = 0
+    fault: str = "none"  # "none" | "ego" | "npc" | "ambiguous"
 
 
 @dataclass
 class EvalResults:
     """Aggregated metrics across all evaluation episodes."""
-    collision_rate: float       # [0, 1]
-    mean_min_ttc: float         # seconds; higher is safer
-    rms_jerk: float             # m/s^3; lower is more comfortable
-    survival_rate: float        # [0, 1]
-    success_rate: float         # [0, 1]
-    fallback_rate: float         # [0, 1]
-    lc_frequency: float          # lane-change initiations per step
-    lc_completion_rate: float    # [0, 1]; NaN if no lane changes attempted
-    lc_anticipatory_frac: float  # [0, 1]; NaN if no lane changes attempted
-    ego_fault_rate: float        # ego-caused collisions / n_episodes
-    npc_fault_rate: float        # unavoidable collisions / n_episodes
+
+    collision_rate: float
+    mean_min_ttc: float | None
+    rms_jerk: float
+    survival_rate: float
+    success_rate: float
+    fallback_rate: float
+    lc_frequency: float
+    lc_completion_rate: float
+    lc_anticipatory_frac: float
+    ego_fault_rate: float
+    npc_fault_rate: float
     mean_distance_travelled: float
     mean_longitudinal_progress: float
     mean_speed: float
     mean_episode_duration: float
+
+    # Legacy convenience fields derived from configured TTC thresholds.
     ttc_below_1s_frac: float
     ttc_below_2s_frac: float
     ttc_below_4s_frac: float
-    ttc_p5_finite: float
+    # Deprecated alias for finite TTC p05.
+    ttc_p5_finite: float | None
+
     n_episodes: int
     n_steps_total: int
+
+    # Explicit counts for correct multi-seed aggregation and diagnostics.
+    n_collisions: int = 0
+    n_survivals: int = 0
+    n_successes: int = 0
+
+    # TTC exposure internals and robust severity metrics.
+    ttc_valid_samples: int = 0
+    ttc_exposure: dict[float, float] = field(default_factory=dict)
+    ttc_exposure_counts: dict[float, int] = field(default_factory=dict)
+    minimum_finite_ttc_s: float | None = None
+    finite_ttc_p05_s: float | None = None
+
+    # Wilson 95% CIs for Bernoulli metrics.
     collision_rate_ci_low: float = float("nan")
     collision_rate_ci_high: float = float("nan")
+    survival_rate_ci_low: float = float("nan")
+    survival_rate_ci_high: float = float("nan")
+    success_rate_ci_low: float = float("nan")
+    success_rate_ci_high: float = float("nan")
+
+    # Bootstrap 95% CIs for continuous metrics.
     mean_speed_ci_low: float = float("nan")
     mean_speed_ci_high: float = float("nan")
     mean_progress_ci_low: float = float("nan")
@@ -93,12 +99,17 @@ class EvalResults:
 
     @property
     def goal_completion(self) -> float:
-        return self.survival_rate
+        """Deprecated compatibility alias for success_rate.
+
+        Do not use this in new reporting code.
+        """
+        return self.success_rate
 
 
 # ---------------------------------------------------------------------------
-# Policy protocol — anything with an .act(obs) -> int method works
+# Policy protocol
 # ---------------------------------------------------------------------------
+
 
 class Policy(Protocol):
     def act(self, obs: np.ndarray) -> int: ...
@@ -108,19 +119,9 @@ class Policy(Protocol):
 # Per-step metric helpers
 # ---------------------------------------------------------------------------
 
+
 def _approach_state(env: gym.Env) -> tuple[bool, float]:
-    """
-    Return (is_closing, ttc) for the front vehicle in ego's lane.
-
-    is_closing is True when the ego is faster than the vehicle ahead
-    (i.e., the gap is shrinking).  ttc is the time-to-collision in seconds
-    (np.inf when the lane is clear or ego is not closing).
-
-    Used to classify lane-change initiations as anticipatory vs reactive:
-      - anticipatory: is_closing=True  AND  ttc > ANTICIPATORY_TTC_THRESHOLD
-      - reactive:     is_closing=True  AND  ttc <= ANTICIPATORY_TTC_THRESHOLD
-      - unpressured:  is_closing=False (no threat; neither category)
-    """
+    """Return (is_closing, ttc) for the front vehicle in ego's lane."""
     road = env.unwrapped.road
     ego = env.unwrapped.vehicle
     try:
@@ -138,13 +139,7 @@ def _approach_state(env: gym.Env) -> tuple[bool, float]:
 
 
 def _compute_ttc(env: gym.Env) -> float:
-    """
-    Compute time-to-collision with the front vehicle in ego's lane.
-
-    TTC = gap / closing_speed, where closing_speed = ego_speed - front_speed.
-    Only meaningful when ego is faster than the vehicle ahead (closing gap).
-    Returns np.inf when the lane is clear or ego is slower than the leader.
-    """
+    """Compute TTC with the front vehicle in ego's lane."""
     road = env.unwrapped.road
     ego = env.unwrapped.vehicle
 
@@ -163,7 +158,7 @@ def _compute_ttc(env: gym.Env) -> float:
 
 
 def _wilson_ci(successes: int, n: int, z: float = 1.959963984540054) -> tuple[float, float]:
-    """Wilson score interval for a Bernoulli proportion."""
+    """Wilson score interval for a Bernoulli proportion (95% by default)."""
     if n <= 0:
         return float("nan"), float("nan")
     p = successes / n
@@ -175,9 +170,10 @@ def _wilson_ci(successes: int, n: int, z: float = 1.959963984540054) -> tuple[fl
 
 
 def _bootstrap_mean_ci(values: list[float], n_samples: int, seed: int) -> tuple[float, float]:
+    """Percentile bootstrap 95% CI for a mean."""
     if not values:
         return float("nan"), float("nan")
-    arr = np.asarray(values, dtype=np.float32)
+    arr = np.asarray(values, dtype=np.float64)
     if len(arr) == 1:
         return float(arr[0]), float(arr[0])
     rng = np.random.default_rng(seed)
@@ -189,42 +185,24 @@ def _bootstrap_mean_ci(values: list[float], n_samples: int, seed: int) -> tuple[
 
 
 def _compute_jerk(speeds: list[float], dt: float) -> float:
-    """
-    Compute RMS longitudinal jerk from a speed time-series.
-
-    jerk_t ≈ (v_{t+1} - 2*v_t + v_{t-1}) / dt^2  (second difference of speed)
-    RMS over all valid timesteps in the episode.
-    """
+    """Compute RMS longitudinal jerk from a speed series."""
     if len(speeds) < 3:
         return 0.0
-    v = np.array(speeds)
-    # Second-order finite difference approximation of jerk
+    v = np.asarray(speeds, dtype=np.float64)
     jerk = (v[2:] - 2 * v[1:-1] + v[:-2]) / (dt ** 2)
     return float(np.sqrt(np.mean(jerk ** 2)))
 
 
-# ---------------------------------------------------------------------------
-# Core evaluation loop
-# ---------------------------------------------------------------------------
-
-def evaluate(
+def _collect_episode_stats(
     policy: Policy,
     env: gym.Env,
-    n_episodes: int = 20,
-    seed: int = 0,
-    fault_horizon_steps: int = 1,
-    config: EvaluationConfig | None = None,
-) -> EvalResults:
-    """
-    Roll out `policy` in `env` for `n_episodes` and return aggregated metrics.
-
-    The policy must expose:  action = policy.act(obs: np.ndarray) -> int
-    An optional safety wrapper is supported: if the wrapper sets
-    info["fallback"] = True on a step, that step is counted as a fallback.
-    """
-    cfg = config or EvaluationConfig()
+    n_episodes: int,
+    seed: int,
+    fault_horizon_steps: int,
+) -> tuple[list[EpisodeStats], float]:
+    """Collect episode-level rollouts and raw statistics."""
     policy_freq = env.unwrapped.config.get("policy_frequency", 1)
-    dt = 1.0 / policy_freq   # seconds per policy step
+    dt = 1.0 / policy_freq
 
     all_episode_stats: list[EpisodeStats] = []
 
@@ -235,114 +213,200 @@ def evaluate(
 
         prev_lane: int | None = None
         start_position = float(env.unwrapped.vehicle.position[0])
+        pre_step = snapshot_pre_step(env)
 
         while not done:
             action = policy.act(obs)
 
-            # Lane-change initiation: LANE_LEFT=0, LANE_RIGHT=2
             if action in (0, 2):
                 stats.n_lc_initiated += 1
-                # Classify as anticipatory if closing on front vehicle with comfortable TTC
                 is_closing, ttc = _approach_state(env)
                 if is_closing and ttc > ANTICIPATORY_TTC_THRESHOLD:
                     stats.n_lc_anticipatory += 1
 
-            # Snapshot state BEFORE the step for counterfactual fault analysis
             pre_step = snapshot_pre_step(env)
-
             obs, _, terminated, truncated, info = env.step(action)
             done = terminated or truncated
 
-            # Speed and TTC
-            ego_speed = env.unwrapped.vehicle.speed
+            ego_speed = float(env.unwrapped.vehicle.speed)
             stats.speeds.append(ego_speed)
             stats.ttcs.append(_compute_ttc(env))
             stats.duration_s += dt
             stats.distance_travelled += ego_speed * dt
             stats.n_steps += 1
 
-            # Lane-change completion: did ego's integer lane number change?
-            current_lane: int = env.unwrapped.vehicle.lane_index[2]
+            current_lane = int(env.unwrapped.vehicle.lane_index[2])
             if prev_lane is not None and current_lane != prev_lane:
                 stats.n_lc_completed += 1
             prev_lane = current_lane
 
-            # Fallback tracking (populated by safety wrapper in Phase 1+)
             if info.get("fallback", False):
                 stats.n_fallbacks += 1
 
-        stats.collision = env.unwrapped.vehicle.crashed
+        stats.collision = bool(env.unwrapped.vehicle.crashed)
         stats.longitudinal_progress = float(env.unwrapped.vehicle.position[0] - start_position)
 
-        # Fault attribution: classify who caused the collision
         if stats.collision:
             stats.fault = classify_fault(pre_step, dt, horizon_steps=fault_horizon_steps)
 
-        if not stats.collision:
-            stats.fault = stats.fault if stats.fault != "none" else "none"
-
         all_episode_stats.append(stats)
 
-    # --- Aggregate ---
-    n_collisions = sum(s.collision for s in all_episode_stats)
+    return all_episode_stats, dt
+
+
+def _ttc_exposure_from_samples(
+    finite_ttcs: list[float],
+    thresholds_s: tuple[float, ...],
+) -> tuple[dict[float, float], dict[float, int], int]:
+    """Compute TTC exposure rates and raw counts over valid TTC samples.
+
+    Exposure denominator is the number of finite TTC samples only.
+    """
+    valid = int(len(finite_ttcs))
+    thresholds = tuple(sorted({float(t) for t in thresholds_s}))
+
+    if valid == 0:
+        return ({t: 0.0 for t in thresholds}, {t: 0 for t in thresholds}, 0)
+
+    arr = np.asarray(finite_ttcs, dtype=np.float64)
+    counts = {t: int(np.sum(arr < t)) for t in thresholds}
+    exposure = {t: counts[t] / valid for t in thresholds}
+    return exposure, counts, valid
+
+
+def _aggregate_episode_stats(
+    all_episode_stats: list[EpisodeStats],
+    dt: float,
+    cfg: EvaluationConfig,
+) -> EvalResults:
+    """Aggregate raw per-episode data into evaluation metrics."""
+    n_episodes = len(all_episode_stats)
+
+    if n_episodes == 0:
+        return EvalResults(
+            collision_rate=0.0,
+            mean_min_ttc=None,
+            rms_jerk=0.0,
+            survival_rate=0.0,
+            success_rate=0.0,
+            fallback_rate=0.0,
+            lc_frequency=0.0,
+            lc_completion_rate=float("nan"),
+            lc_anticipatory_frac=float("nan"),
+            ego_fault_rate=0.0,
+            npc_fault_rate=0.0,
+            mean_distance_travelled=0.0,
+            mean_longitudinal_progress=0.0,
+            mean_speed=0.0,
+            mean_episode_duration=0.0,
+            ttc_below_1s_frac=float("nan"),
+            ttc_below_2s_frac=float("nan"),
+            ttc_below_4s_frac=float("nan"),
+            ttc_p5_finite=None,
+            n_episodes=0,
+            n_steps_total=0,
+        )
+
+    n_collisions = sum(1 for s in all_episode_stats if s.collision)
+    n_survivals = n_episodes - n_collisions
+
     n_total_steps = sum(s.n_steps for s in all_episode_stats)
     n_total_fallbacks = sum(s.n_fallbacks for s in all_episode_stats)
     n_total_lc_initiated = sum(s.n_lc_initiated for s in all_episode_stats)
     n_total_lc_completed = sum(s.n_lc_completed for s in all_episode_stats)
     n_total_lc_anticipatory = sum(s.n_lc_anticipatory for s in all_episode_stats)
 
-    min_ttcs = [min(s.ttcs) for s in all_episode_stats if s.ttcs]
-    rms_jerks = [_compute_jerk(s.speeds, dt) for s in all_episode_stats]
-    finite_ttcs = [ttc for s in all_episode_stats for ttc in s.ttcs if np.isfinite(ttc)]
-    episode_speed_means = [float(np.mean(s.speeds)) for s in all_episode_stats if s.speeds]
-    episode_distances = [s.distance_travelled for s in all_episode_stats]
-    episode_progress = [s.longitudinal_progress for s in all_episode_stats]
-    episode_survival = [0.0 if s.collision else 1.0 for s in all_episode_stats]
-    episode_success = [
-        1.0 if (not s.collision and s.longitudinal_progress >= cfg.min_success_progress_m and float(np.mean(s.speeds)) >= cfg.min_success_mean_speed_mps) else 0.0
+    episode_speed_means = [float(np.mean(s.speeds)) if s.speeds else 0.0 for s in all_episode_stats]
+    episode_distances = [float(s.distance_travelled) for s in all_episode_stats]
+    episode_progress = [float(s.longitudinal_progress) for s in all_episode_stats]
+    episode_durations = [float(s.duration_s) for s in all_episode_stats]
+
+    episode_success_flags = [
+        1
+        if (
+            (not s.collision)
+            and (float(s.longitudinal_progress) >= cfg.min_success_progress_m)
+            and ((float(np.mean(s.speeds)) if s.speeds else 0.0) >= cfg.min_success_mean_speed_mps)
+        )
+        else 0
         for s in all_episode_stats
     ]
+    n_successes = int(sum(episode_success_flags))
+
+    rms_jerks = [_compute_jerk(s.speeds, dt) for s in all_episode_stats]
+
+    finite_ttcs = [ttc for s in all_episode_stats for ttc in s.ttcs if np.isfinite(ttc)]
+    min_finite_ttc_per_episode: list[float] = []
+    for s in all_episode_stats:
+        finite_episode = [ttc for ttc in s.ttcs if np.isfinite(ttc)]
+        if finite_episode:
+            min_finite_ttc_per_episode.append(float(min(finite_episode)))
+
+    ttc_exposure, ttc_exposure_counts, ttc_valid_samples = _ttc_exposure_from_samples(
+        finite_ttcs, cfg.ttc_thresholds_s
+    )
+
+    minimum_finite_ttc_s = float(np.min(finite_ttcs)) if finite_ttcs else None
+    finite_ttc_p05_s = float(np.percentile(finite_ttcs, 5.0)) if finite_ttcs else None
+    mean_min_ttc = float(np.mean(min_finite_ttc_per_episode)) if min_finite_ttc_per_episode else None
 
     _nan = float("nan")
-    lc_completion_rate = (
-        n_total_lc_completed / n_total_lc_initiated
-        if n_total_lc_initiated > 0 else _nan
-    )
-    lc_anticipatory_frac = (
-        n_total_lc_anticipatory / n_total_lc_initiated
-        if n_total_lc_initiated > 0 else _nan
-    )
+    lc_completion_rate = n_total_lc_completed / n_total_lc_initiated if n_total_lc_initiated > 0 else _nan
+    lc_anticipatory_frac = n_total_lc_anticipatory / n_total_lc_initiated if n_total_lc_initiated > 0 else _nan
+
     n_ego_fault = sum(1 for s in all_episode_stats if s.fault == "ego")
     n_npc_fault = sum(1 for s in all_episode_stats if s.fault == "npc")
+
     coll_ci_low, coll_ci_high = _wilson_ci(n_collisions, n_episodes)
-    mean_speed_ci_low, mean_speed_ci_high = _bootstrap_mean_ci(episode_speed_means, cfg.bootstrap_samples, cfg.bootstrap_seed)
-    mean_progress_ci_low, mean_progress_ci_high = _bootstrap_mean_ci(episode_progress, cfg.bootstrap_samples, cfg.bootstrap_seed)
-    mean_distance_ci_low, mean_distance_ci_high = _bootstrap_mean_ci(episode_distances, cfg.bootstrap_samples, cfg.bootstrap_seed)
+    surv_ci_low, surv_ci_high = _wilson_ci(n_survivals, n_episodes)
+    succ_ci_low, succ_ci_high = _wilson_ci(n_successes, n_episodes)
+
+    mean_speed_ci_low, mean_speed_ci_high = _bootstrap_mean_ci(
+        episode_speed_means, cfg.bootstrap_samples, cfg.bootstrap_seed
+    )
+    mean_progress_ci_low, mean_progress_ci_high = _bootstrap_mean_ci(
+        episode_progress, cfg.bootstrap_samples, cfg.bootstrap_seed
+    )
+    mean_distance_ci_low, mean_distance_ci_high = _bootstrap_mean_ci(
+        episode_distances, cfg.bootstrap_samples, cfg.bootstrap_seed
+    )
 
     return EvalResults(
         collision_rate=n_collisions / n_episodes,
-        mean_min_ttc=float(np.mean(min_ttcs)) if min_ttcs else np.inf,
+        mean_min_ttc=mean_min_ttc,
         rms_jerk=float(np.mean(rms_jerks)),
-        survival_rate=float(np.mean(episode_survival)) if episode_survival else 0.0,
-        success_rate=float(np.mean(episode_success)) if episode_success else 0.0,
+        survival_rate=n_survivals / n_episodes,
+        success_rate=n_successes / n_episodes,
         fallback_rate=n_total_fallbacks / n_total_steps if n_total_steps > 0 else 0.0,
         lc_frequency=n_total_lc_initiated / n_total_steps if n_total_steps > 0 else 0.0,
         lc_completion_rate=lc_completion_rate,
         lc_anticipatory_frac=lc_anticipatory_frac,
         ego_fault_rate=n_ego_fault / n_episodes,
         npc_fault_rate=n_npc_fault / n_episodes,
-        mean_distance_travelled=float(np.mean(episode_distances)) if episode_distances else 0.0,
-        mean_longitudinal_progress=float(np.mean(episode_progress)) if episode_progress else 0.0,
-        mean_speed=float(np.mean(episode_speed_means)) if episode_speed_means else 0.0,
-        mean_episode_duration=float(np.mean([s.duration_s for s in all_episode_stats])) if all_episode_stats else 0.0,
-        ttc_below_1s_frac=float(np.mean([ttc < 1.0 for ttc in finite_ttcs])) if finite_ttcs else 0.0,
-        ttc_below_2s_frac=float(np.mean([ttc < 2.0 for ttc in finite_ttcs])) if finite_ttcs else 0.0,
-        ttc_below_4s_frac=float(np.mean([ttc < 4.0 for ttc in finite_ttcs])) if finite_ttcs else 0.0,
-        ttc_p5_finite=float(np.percentile(finite_ttcs, 5.0)) if finite_ttcs else np.inf,
+        mean_distance_travelled=float(np.mean(episode_distances)),
+        mean_longitudinal_progress=float(np.mean(episode_progress)),
+        mean_speed=float(np.mean(episode_speed_means)),
+        mean_episode_duration=float(np.mean(episode_durations)),
+        ttc_below_1s_frac=ttc_exposure.get(1.0, _nan),
+        ttc_below_2s_frac=ttc_exposure.get(2.0, _nan),
+        ttc_below_4s_frac=ttc_exposure.get(4.0, _nan),
+        ttc_p5_finite=finite_ttc_p05_s,
         n_episodes=n_episodes,
         n_steps_total=n_total_steps,
+        n_collisions=n_collisions,
+        n_survivals=n_survivals,
+        n_successes=n_successes,
+        ttc_valid_samples=ttc_valid_samples,
+        ttc_exposure=ttc_exposure,
+        ttc_exposure_counts=ttc_exposure_counts,
+        minimum_finite_ttc_s=minimum_finite_ttc_s,
+        finite_ttc_p05_s=finite_ttc_p05_s,
         collision_rate_ci_low=coll_ci_low,
         collision_rate_ci_high=coll_ci_high,
+        survival_rate_ci_low=surv_ci_low,
+        survival_rate_ci_high=surv_ci_high,
+        success_rate_ci_low=succ_ci_low,
+        success_rate_ci_high=succ_ci_high,
         mean_speed_ci_low=mean_speed_ci_low,
         mean_speed_ci_high=mean_speed_ci_high,
         mean_progress_ci_low=mean_progress_ci_low,
@@ -350,6 +414,39 @@ def evaluate(
         mean_distance_travelled_ci_low=mean_distance_ci_low,
         mean_distance_travelled_ci_high=mean_distance_ci_high,
     )
+
+
+# ---------------------------------------------------------------------------
+# Core evaluation API
+# ---------------------------------------------------------------------------
+
+
+def evaluate(
+    policy: Policy,
+    env: gym.Env,
+    n_episodes: int = 20,
+    seed: int = 0,
+    fault_horizon_steps: int = 1,
+    config: EvaluationConfig | None = None,
+) -> EvalResults:
+    """Evaluate one policy for n_episodes.
+
+    Success is defined as:
+      not collided
+      and longitudinal_progress_m >= min_success_progress_m
+      and mean_speed_mps >= min_success_mean_speed_mps
+
+    Continuous 95% CIs are percentile bootstrap CIs.
+    """
+    cfg = config or EvaluationConfig()
+    all_episode_stats, dt = _collect_episode_stats(
+        policy=policy,
+        env=env,
+        n_episodes=n_episodes,
+        seed=seed,
+        fault_horizon_steps=fault_horizon_steps,
+    )
+    return _aggregate_episode_stats(all_episode_stats, dt=dt, cfg=cfg)
 
 
 def evaluate_across_seeds(
@@ -361,131 +458,79 @@ def evaluate_across_seeds(
     fault_horizon_steps: int = 1,
     config: EvaluationConfig | None = None,
 ) -> EvalResults:
-    """
-    Evaluate a policy across multiple seeds and aggregate metrics.
+    """Evaluate a policy across seeds and aggregate from raw episode stats.
 
-    Rate metrics are averaged with sensible denominators:
-      - per-episode rates by total episodes
-      - per-step rates by total steps
-      - lane-change fractions by per-seed mean (ignoring NaNs)
+    Aggregation is performed using episode/step/sample counts, not naïve means of
+    already-aggregated percentages.
     """
     if n_seeds < 1:
         raise ValueError("n_seeds must be >= 1")
     if episodes_per_seed < 1:
         raise ValueError("episodes_per_seed must be >= 1")
 
-    per_seed: list[EvalResults] = []
-    for s in range(n_seeds):
-        per_seed.append(
-            evaluate(
-                policy=policy,
-                env=env,
-                n_episodes=episodes_per_seed,
-                seed=base_seed + s,
-                fault_horizon_steps=fault_horizon_steps,
-                config=config,
-            )
-        )
-
-    total_episodes = n_seeds * episodes_per_seed
-    total_steps = sum(r.n_steps_total for r in per_seed)
-
-    collision_count = int(round(sum(r.collision_rate * r.n_episodes for r in per_seed)))
-    ego_fault_count = int(round(sum(r.ego_fault_rate * r.n_episodes for r in per_seed)))
-    npc_fault_count = int(round(sum(r.npc_fault_rate * r.n_episodes for r in per_seed)))
-
-    lc_completion_vals = [r.lc_completion_rate for r in per_seed if r.lc_completion_rate == r.lc_completion_rate]
-    lc_anticipatory_vals = [r.lc_anticipatory_frac for r in per_seed if r.lc_anticipatory_frac == r.lc_anticipatory_frac]
-    speed_vals = [r.mean_speed for r in per_seed]
-    progress_vals = [r.mean_longitudinal_progress for r in per_seed]
-    distance_vals = [r.mean_distance_travelled for r in per_seed]
-
-    coll_ci_low, coll_ci_high = _wilson_ci(collision_count, total_episodes)
     cfg = config or EvaluationConfig()
-    mean_speed_ci_low, mean_speed_ci_high = _bootstrap_mean_ci(speed_vals, cfg.bootstrap_samples, cfg.bootstrap_seed)
-    mean_progress_ci_low, mean_progress_ci_high = _bootstrap_mean_ci(progress_vals, cfg.bootstrap_samples, cfg.bootstrap_seed)
-    mean_distance_ci_low, mean_distance_ci_high = _bootstrap_mean_ci(distance_vals, cfg.bootstrap_samples, cfg.bootstrap_seed)
+    all_episode_stats: list[EpisodeStats] = []
+    dt: float | None = None
 
-    return EvalResults(
-        collision_rate=collision_count / total_episodes,
-        mean_min_ttc=float(np.mean([r.mean_min_ttc for r in per_seed])),
-        rms_jerk=float(np.mean([r.rms_jerk for r in per_seed])),
-        survival_rate=float(np.mean([r.survival_rate for r in per_seed])),
-        success_rate=float(np.mean([r.success_rate for r in per_seed])),
-        fallback_rate=(
-            sum(r.fallback_rate * r.n_steps_total for r in per_seed) / total_steps
-            if total_steps > 0 else 0.0
-        ),
-        lc_frequency=(
-            sum(r.lc_frequency * r.n_steps_total for r in per_seed) / total_steps
-            if total_steps > 0 else 0.0
-        ),
-        lc_completion_rate=(
-            float(np.mean(lc_completion_vals)) if lc_completion_vals else float("nan")
-        ),
-        lc_anticipatory_frac=(
-            float(np.mean(lc_anticipatory_vals)) if lc_anticipatory_vals else float("nan")
-        ),
-        ego_fault_rate=ego_fault_count / total_episodes,
-        npc_fault_rate=npc_fault_count / total_episodes,
-        mean_distance_travelled=float(np.mean(distance_vals)),
-        mean_longitudinal_progress=float(np.mean(progress_vals)),
-        mean_speed=float(np.mean(speed_vals)),
-        mean_episode_duration=float(np.mean([r.mean_episode_duration for r in per_seed])),
-        ttc_below_1s_frac=float(np.mean([r.ttc_below_1s_frac for r in per_seed])),
-        ttc_below_2s_frac=float(np.mean([r.ttc_below_2s_frac for r in per_seed])),
-        ttc_below_4s_frac=float(np.mean([r.ttc_below_4s_frac for r in per_seed])),
-        ttc_p5_finite=float(np.mean([r.ttc_p5_finite for r in per_seed])),
-        n_episodes=total_episodes,
-        n_steps_total=total_steps,
-        collision_rate_ci_low=coll_ci_low,
-        collision_rate_ci_high=coll_ci_high,
-        mean_speed_ci_low=mean_speed_ci_low,
-        mean_speed_ci_high=mean_speed_ci_high,
-        mean_progress_ci_low=mean_progress_ci_low,
-        mean_progress_ci_high=mean_progress_ci_high,
-        mean_distance_travelled_ci_low=mean_distance_ci_low,
-        mean_distance_travelled_ci_high=mean_distance_ci_high,
-    )
+    for s in range(n_seeds):
+        seed_stats, seed_dt = _collect_episode_stats(
+            policy=policy,
+            env=env,
+            n_episodes=episodes_per_seed,
+            seed=base_seed + s,
+            fault_horizon_steps=fault_horizon_steps,
+        )
+        if dt is None:
+            dt = seed_dt
+        all_episode_stats.extend(seed_stats)
+
+    return _aggregate_episode_stats(all_episode_stats, dt=(dt if dt is not None else 1.0), cfg=cfg)
 
 
 # ---------------------------------------------------------------------------
 # Pretty-print
 # ---------------------------------------------------------------------------
 
+
 def print_table(results: EvalResults, label: str = "Policy") -> None:
     """Print a formatted metric table to stdout."""
-    border = "+" + "-" * 30 + "+" + "-" * 12 + "+"
+    border = "+" + "-" * 30 + "+" + "-" * 14 + "+"
     print(border)
-    print(f"| {'Metric':<28} | {'Value':>10} |")
+    print(f"| {'Metric':<28} | {'Value':>12} |")
     print(border)
-    def _fmt(v: float) -> str:
-        return "N/A" if v != v else f"{v:.3f}"  # NaN check via reflexivity
+
+    def _fmt(v: float | None) -> str:
+        if v is None:
+            return "N/A"
+        if isinstance(v, float) and v != v:
+            return "N/A"
+        return f"{v:.3f}"
 
     rows = [
-        ("Policy",               label),
-        ("Episodes",             str(results.n_episodes)),
-        ("Collision rate",       f"{results.collision_rate:.3f}"),
-        (
-            "Collision 95% CI",
-            _fmt(results.collision_rate_ci_low) + "-" + _fmt(results.collision_rate_ci_high),
-        ),
-        ("Survival rate",        f"{results.survival_rate:.3f}"),
-        ("Success rate",         f"{results.success_rate:.3f}"),
-        ("Mean min TTC (s)",     f"{results.mean_min_ttc:.2f}"),
-        ("RMS jerk (m/s³)",      f"{results.rms_jerk:.3f}"),
-        ("Fallback rate",        f"{results.fallback_rate:.3f}"),
+        ("Policy", label),
+        ("Episodes", str(results.n_episodes)),
+        ("Collision rate", f"{results.collision_rate:.3f}"),
+        ("Collision 95% CI", _fmt(results.collision_rate_ci_low) + "-" + _fmt(results.collision_rate_ci_high)),
+        ("Survival rate", f"{results.survival_rate:.3f}"),
+        ("Survival 95% CI", _fmt(results.survival_rate_ci_low) + "-" + _fmt(results.survival_rate_ci_high)),
+        ("Success rate", f"{results.success_rate:.3f}"),
+        ("Success 95% CI", _fmt(results.success_rate_ci_low) + "-" + _fmt(results.success_rate_ci_high)),
+        ("Mean min TTC (s)", _fmt(results.mean_min_ttc)),
+        ("Min finite TTC (s)", _fmt(results.minimum_finite_ttc_s)),
+        ("Finite TTC p05 (s)", _fmt(results.finite_ttc_p05_s)),
+        ("TTC < 1s exposure", _fmt(results.ttc_below_1s_frac)),
+        ("TTC < 2s exposure", _fmt(results.ttc_below_2s_frac)),
+        ("TTC < 4s exposure", _fmt(results.ttc_below_4s_frac)),
+        ("RMS jerk (m/s^3)", f"{results.rms_jerk:.3f}"),
+        ("Fallback rate", f"{results.fallback_rate:.3f}"),
         ("LC frequency (/step)", f"{results.lc_frequency:.3f}"),
-        ("LC completion rate",   _fmt(results.lc_completion_rate)),
+        ("LC completion rate", _fmt(results.lc_completion_rate)),
         ("LC anticipatory frac", _fmt(results.lc_anticipatory_frac)),
-        ("Ego fault rate",       f"{results.ego_fault_rate:.3f}"),
-        ("NPC fault rate",       f"{results.npc_fault_rate:.3f}"),
-        ("Mean speed (m/s)",     f"{results.mean_speed:.3f}"),
-        ("Mean progress (m)",    f"{results.mean_longitudinal_progress:.3f}"),
-        ("TTC < 1s frac",        f"{results.ttc_below_1s_frac:.3f}"),
-        ("TTC < 2s frac",        f"{results.ttc_below_2s_frac:.3f}"),
-        ("TTC < 4s frac",        f"{results.ttc_below_4s_frac:.3f}"),
+        ("Ego fault rate", f"{results.ego_fault_rate:.3f}"),
+        ("NPC fault rate", f"{results.npc_fault_rate:.3f}"),
+        ("Mean speed (m/s)", f"{results.mean_speed:.3f}"),
+        ("Mean progress (m)", f"{results.mean_longitudinal_progress:.3f}"),
     ]
     for name, val in rows:
-        print(f"| {name:<28} | {val:>10} |")
+        print(f"| {name:<28} | {val:>12} |")
     print(border)

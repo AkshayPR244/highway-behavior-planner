@@ -258,12 +258,15 @@ class TestEnvWrapper:
 # ---------------------------------------------------------------------------
 
 from safety.safety_wrapper import (
+    _propagate_longitudinal,
     _project_front_gap,
     _project_rear_gap,
     is_action_safe,
+    SafetyWrapper,
     SafetyFilteredEnv,
     LANE_LEFT, IDLE, LANE_RIGHT, FASTER, SLOWER,
 )
+from config.settings import SafetyConfig
 
 
 class TestForwardProjection:
@@ -293,6 +296,34 @@ class TestForwardProjection:
         )
         assert min_gap == pytest.approx(15.0)
 
+    def test_propagate_brake_to_stop_without_reverse(self):
+        """A braking vehicle may stop, but must not reverse in prediction."""
+        x1, v1 = _propagate_longitudinal(position=0.0, speed=2.0, acceleration=-4.0, dt=1.0)
+        assert x1 == pytest.approx(0.5)
+        assert v1 == pytest.approx(0.0)
+
+        x2, v2 = _propagate_longitudinal(position=x1, speed=v1, acceleration=-4.0, dt=1.0)
+        assert x2 == pytest.approx(x1)
+        assert v2 == pytest.approx(0.0)
+
+    def test_front_gap_monotonic_with_initial_gap(self):
+        """Larger initial front gap should not reduce minimum predicted gap."""
+        g_small = _project_front_gap(10.0, 25.0, 20.0, dt=1.0, horizon=6, ego_accel=0.0, front_accel=-4.0)
+        g_large = _project_front_gap(20.0, 25.0, 20.0, dt=1.0, horizon=6, ego_accel=0.0, front_accel=-4.0)
+        assert g_large >= g_small
+
+    def test_front_gap_monotonic_with_ego_acceleration(self):
+        """Higher ego acceleration should not improve front clearance."""
+        g_idle = _project_front_gap(35.0, 20.0, 20.0, dt=1.0, horizon=6, ego_accel=0.0, front_accel=-4.0)
+        g_fast = _project_front_gap(35.0, 20.0, 20.0, dt=1.0, horizon=6, ego_accel=2.0, front_accel=-4.0)
+        assert g_fast <= g_idle
+
+    def test_front_gap_monotonic_with_leader_braking(self):
+        """Stronger leader braking should not improve front clearance."""
+        g_weak = _project_front_gap(35.0, 20.0, 20.0, dt=1.0, horizon=6, ego_accel=0.0, front_accel=-1.0)
+        g_strong = _project_front_gap(35.0, 20.0, 20.0, dt=1.0, horizon=6, ego_accel=0.0, front_accel=-6.0)
+        assert g_strong <= g_weak
+
     # --- _project_rear_gap ---
 
     def test_rear_gap_decreases_when_rear_faster(self):
@@ -311,6 +342,12 @@ class TestForwardProjection:
         )
         assert min_gap == pytest.approx(20.0)
 
+    def test_rear_gap_monotonic_with_rear_acceleration(self):
+        """Higher rear acceleration should not improve rear clearance."""
+        g_low = _project_rear_gap(20.0, 20.0, 25.0, dt=1.0, horizon=6, ego_accel=0.0, rear_accel=0.5)
+        g_high = _project_rear_gap(20.0, 20.0, 25.0, dt=1.0, horizon=6, ego_accel=0.0, rear_accel=2.0)
+        assert g_high <= g_low
+
 
 class TestIsActionSafe:
     """
@@ -325,6 +362,8 @@ class TestIsActionSafe:
         n_lanes=3,
         front_gap=100.0,
         front_speed=25.0,
+        rear_gap=100.0,
+        rear_speed=25.0,
         rear_gap_left=100.0,
         rear_speed_left=25.0,
         rear_gap_right=100.0,
@@ -336,6 +375,8 @@ class TestIsActionSafe:
             n_lanes=n_lanes,
             front_gap=front_gap,
             front_speed=front_speed,
+            rear_gap=rear_gap,
+            rear_speed=rear_speed,
             rear_gap_left=rear_gap_left,
             rear_speed_left=rear_speed_left,
             rear_gap_right=rear_gap_right,
@@ -352,6 +393,17 @@ class TestIsActionSafe:
         state = self._state(front_gap=100.0, front_speed=25.0, ego_speed=25.0)
         assert is_action_safe(state, SLOWER, dt=1.0, horizon=6, min_gap=4.0) is True
 
+    def test_slower_unsafe_with_fast_current_lane_rear(self):
+        """SLOWER must account for rear-closing risk in the current lane."""
+        state = self._state(
+            ego_speed=25.0,
+            front_gap=100.0,
+            front_speed=25.0,
+            rear_gap=8.0,
+            rear_speed=45.0,
+        )
+        assert is_action_safe(state, SLOWER, dt=1.0, horizon=6, min_gap=4.0) is False
+
     def test_idle_safe_with_large_front_gap(self):
         state = self._state(front_gap=100.0, front_speed=25.0, ego_speed=25.0)
         assert is_action_safe(state, IDLE, dt=1.0, horizon=6, min_gap=4.0) is True
@@ -362,6 +414,13 @@ class TestIsActionSafe:
         # After 1 s the gap is 5 - 25 = -20, well below MIN_GAP
         assert is_action_safe(state, IDLE, dt=1.0, horizon=6, min_gap=4.0) is False
 
+    def test_braking_leader_can_make_idle_unsafe(self):
+        """Case that looks safe under constant velocity but unsafe with braking leader."""
+        state = self._state(ego_speed=20.0, front_gap=28.0, front_speed=20.0)
+        # Under constant velocity the gap stays 28 m; with conservative leader braking
+        # the leader can stop while ego keeps moving, violating minimum clearance.
+        assert is_action_safe(state, IDLE, dt=1.0, horizon=6, min_gap=4.0) is False
+
     def test_faster_uses_higher_speed(self):
         """
         FASTER projects with ego_speed + 1.  A state that is borderline safe at
@@ -369,6 +428,11 @@ class TestIsActionSafe:
         """
         # Gap=5, closing at 25 m/s → after 1 s gap = -20 → clearly unsafe at any speed
         state = self._state(ego_speed=25.0, front_gap=5.0, front_speed=0.0)
+        assert is_action_safe(state, FASTER, dt=1.0, horizon=6, min_gap=4.0) is False
+
+    def test_faster_catches_braking_leader(self):
+        """FASTER should be rejected when ego accel plus leader braking closes the gap."""
+        state = self._state(ego_speed=20.0, front_gap=35.0, front_speed=20.0)
         assert is_action_safe(state, FASTER, dt=1.0, horizon=6, min_gap=4.0) is False
 
     def test_lane_left_blocked_at_leftmost_lane(self):
@@ -428,6 +492,149 @@ class TestIsActionSafe:
     def test_unknown_action_fails_closed(self):
         state = self._state()
         assert is_action_safe(state, 99, dt=1.0, horizon=6, min_gap=4.0) is False
+
+    def test_configuration_sensitivity_stronger_leader_brake_more_conservative(self):
+        """Increasing assumed leader braking should not make an unsafe case look safer."""
+        state = self._state(ego_speed=20.0, front_gap=35.0, front_speed=20.0)
+
+        weak_brake_cfg = SafetyConfig(front_vehicle_max_braking_mps2=1.0)
+        strong_brake_cfg = SafetyConfig(front_vehicle_max_braking_mps2=6.0)
+
+        weak_safe = is_action_safe(
+            state,
+            IDLE,
+            dt=1.0,
+            horizon=6,
+            min_gap=4.0,
+            safety_config=weak_brake_cfg,
+        )
+        strong_safe = is_action_safe(
+            state,
+            IDLE,
+            dt=1.0,
+            horizon=6,
+            min_gap=4.0,
+            safety_config=strong_brake_cfg,
+        )
+        assert (not strong_safe) or weak_safe
+
+
+class TestSafetyWrapperFallbackSemantics:
+    class _Policy:
+        def __init__(self, action: int):
+            self._action = action
+
+        def act(self, obs: np.ndarray) -> int:
+            return int(self._action)
+
+    class _FakeUnwrapped:
+        def __init__(self):
+            self.config = {"policy_frequency": 1, "lanes_count": 3}
+
+    class _FakeEnv:
+        def __init__(self):
+            self.unwrapped = TestSafetyWrapperFallbackSemantics._FakeUnwrapped()
+
+    def _make_wrapper(self, inner_action: int, fallback_action: int) -> SafetyWrapper:
+        env = self._FakeEnv()
+        return SafetyWrapper(
+            inner=self._Policy(inner_action),
+            env=env,
+            fallback_policy=self._Policy(fallback_action),
+            horizon=6,
+            min_gap=4.0,
+        )
+
+    def test_safe_primary_action_is_preserved(self, monkeypatch):
+        wrapper = self._make_wrapper(inner_action=IDLE, fallback_action=SLOWER)
+
+        monkeypatch.setattr(
+            "safety.safety_wrapper._get_road_state",
+            lambda _env: {"ego_speed": 25.0, "ego_lane": 1, "n_lanes": 3, "front_gap": 100.0, "front_speed": 25.0, "rear_gap": 100.0, "rear_speed": 25.0},
+        )
+        monkeypatch.setattr(
+            "safety.safety_wrapper._evaluate_action_safety",
+            lambda state, action, dt, horizon, min_gap, safety_config=None: (action == IDLE, {"minimum_predicted_front_gap": np.nan, "minimum_predicted_rear_gap": np.nan, "prediction_failure": False}),
+        )
+
+        action, info = wrapper.act_with_info(np.zeros(25, dtype=np.float32))
+        assert action == IDLE
+        assert info["fallback"] is False
+        assert info["primary_rejected"] is False
+        assert info["executed_action"] == IDLE
+
+    def test_unsafe_primary_safe_checked_fallback_executes_fallback(self, monkeypatch):
+        wrapper = self._make_wrapper(inner_action=FASTER, fallback_action=IDLE)
+
+        monkeypatch.setattr(
+            "safety.safety_wrapper._get_road_state",
+            lambda _env: {"ego_speed": 25.0, "ego_lane": 1, "n_lanes": 3, "front_gap": 5.0, "front_speed": 0.0, "rear_gap": 100.0, "rear_speed": 20.0},
+        )
+        monkeypatch.setattr(
+            "safety.safety_wrapper._evaluate_action_safety",
+            lambda state, action, dt, horizon, min_gap, safety_config=None: (action == IDLE, {"minimum_predicted_front_gap": np.nan, "minimum_predicted_rear_gap": np.nan, "prediction_failure": False}),
+        )
+
+        action, info = wrapper.act_with_info(np.zeros(25, dtype=np.float32))
+        assert action == IDLE
+        assert info["fallback"] is True
+        assert info["primary_action"] == FASTER
+        assert info["primary_rejected"] is True
+        assert info["fallback_action"] == IDLE
+        assert info["fallback_rejected"] is False
+        assert info["executed_action"] == IDLE
+        assert info["no_safe_action_found"] is False
+
+    def test_unsafe_primary_unsafe_fallback_executes_safe_emergency(self, monkeypatch):
+        wrapper = self._make_wrapper(inner_action=FASTER, fallback_action=LANE_LEFT)
+
+        monkeypatch.setattr(
+            "safety.safety_wrapper._get_road_state",
+            lambda _env: {"ego_speed": 25.0, "ego_lane": 1, "n_lanes": 3, "front_gap": 5.0, "front_speed": 0.0, "rear_gap": 100.0, "rear_speed": 20.0},
+        )
+        monkeypatch.setattr(
+            "safety.safety_wrapper._evaluate_action_safety",
+            lambda state, action, dt, horizon, min_gap, safety_config=None: (action == SLOWER, {"minimum_predicted_front_gap": np.nan, "minimum_predicted_rear_gap": np.nan, "prediction_failure": False}),
+        )
+
+        action, info = wrapper.act_with_info(np.zeros(25, dtype=np.float32))
+        assert action == SLOWER
+        assert info["fallback"] is True
+        assert info["fallback_action"] == LANE_LEFT
+        assert info["fallback_rejected"] is True
+        assert info["executed_action"] == SLOWER
+        assert info["no_safe_action_found"] is False
+
+    def test_no_safe_candidate_sets_flag_and_uses_last_resort(self, monkeypatch):
+        wrapper = self._make_wrapper(inner_action=FASTER, fallback_action=LANE_LEFT)
+
+        monkeypatch.setattr(
+            "safety.safety_wrapper._get_road_state",
+            lambda _env: {"ego_speed": 25.0, "ego_lane": 1, "n_lanes": 3, "front_gap": 2.0, "front_speed": 0.0, "rear_gap": 2.0, "rear_speed": 40.0},
+        )
+        monkeypatch.setattr(
+            "safety.safety_wrapper._evaluate_action_safety",
+            lambda state, action, dt, horizon, min_gap, safety_config=None: (False, {"minimum_predicted_front_gap": np.nan, "minimum_predicted_rear_gap": np.nan, "prediction_failure": False}),
+        )
+
+        action, info = wrapper.act_with_info(np.zeros(25, dtype=np.float32))
+        assert action == IDLE
+        assert info["fallback"] is True
+        assert info["no_safe_action_found"] is True
+        assert info["executed_action"] == IDLE
+
+    def test_road_state_failure_rejects_action_conservatively(self, monkeypatch):
+        wrapper = self._make_wrapper(inner_action=IDLE, fallback_action=SLOWER)
+
+        monkeypatch.setattr(
+            "safety.safety_wrapper._get_road_state",
+            lambda _env: {"state_error": "forced_failure"},
+        )
+
+        action, info = wrapper.act_with_info(np.zeros(25, dtype=np.float32))
+        assert action == IDLE
+        assert info["state_query_failed"] is True
+        assert info["primary_rejected"] is True
 
 
 class TestSafetyFilteredEnv:

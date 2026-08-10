@@ -1,0 +1,109 @@
+{
+  "validation_partition": {
+    "base_seed": 10042,
+    "num_seeds": 10,
+    "episodes_per_seed": 20,
+    "seeds": [
+      10042,
+      10043,
+      10044,
+      10045,
+      10046,
+      10047,
+      10048,
+      10049,
+      10050,
+      10051
+    ],
+    "total_episodes": 200,
+    "fault_horizon_steps": 5
+  },
+  "checkpoint_ranking": {
+    "cmdp_selected_by_constraint_first_policy": "cmdp_iter0040.pt",
+    "cmdp_ranking_top5": [
+      "cmdp_iter0040.pt",
+      "cmdp_iter0020.pt",
+      "cmdp_iter0012.pt",
+      "cmdp_iter0010.pt",
+      "cmdp_iter0030.pt"
+    ],
+    "promoted_cmdp_final_matches": [
+      "results/retrain_eval/20260809_174519_production_stability/cmdp_seed1.pt"
+    ],
+    "promoted_ppo_final_matches": [
+      "results/ppo_unconstrained/ppo_iter0016.pt",
+      "results/retrain_eval/20260809_174519_production_stability/ppo_unconstrained_seed1.pt",
+      "results/retrain_eval/20260809_174519_production_stability/ppo_unconstrained_seed13.pt",
+      "results/retrain_eval/20260809_174519_production_stability/ppo_unconstrained_seed7.pt"
+    ]
+  },
+  "lambda_history_supporting_run": {
+    "iterations": 60,
+    "lambda_start": 0.0376829268292683,
+    "lambda_end": 1.7519107593659242,
+    "lambda_min": 0.0376829268292683,
+    "lambda_max": 1.7519107593659242,
+    "lambda_mean": 0.6947724083672794,
+    "collision_rate_mean": 0.6839702531219747,
+    "collision_rate_min": 0.0,
+    "collision_rate_max": 1.0,
+    "updates_with_zero_completed_episodes_frac": 1.0,
+    "updates_with_one_completed_episode_frac": 0.0,
+    "updates_with_zero_collisions_frac": 0.016666666666666666,
+    "updates_with_full_collisions_frac": 0.38333333333333336,
+    "lambda_delta_mean": 0.02919851265609874,
+    "lambda_delta_std": 0.017623391197964133,
+    "lambda_delta_p05": 0.0021428571428571686,
+    "lambda_delta_p95": 0.04500000000000004
+  },
+  "rollout_sparsity_train_partition": {
+    "n_rollouts": 30,
+    "rollout_length_steps": 512,
+    "completed_episodes_per_rollout_mean": 14.666666666666666,
+    "completed_episodes_per_rollout_min": 12,
+    "completed_episodes_per_rollout_max": 17,
+    "collision_episodes_per_rollout_mean": 4.866666666666666,
+    "fraction_rollouts_zero_collisions": 0.06666666666666667,
+    "fraction_rollouts_zero_completed_episodes": 0.0,
+    "fraction_rollouts_one_completed_episode": 0.0
+  },
+  "advantage_magnitude_train_partition": {
+    "lambda_used_for_scaling": 1.7519107593659242,
+    "mean_abs_reward_adv": 7.39034366607666,
+    "mean_abs_cost_adv": 0.10645640641450882,
+    "mean_abs_lambda_cost_adv": 0.186502143740654,
+    "std_reward_adv": 3.2284488677978516,
+    "std_cost_adv": 0.16304384171962738,
+    "std_combined_adv_pre_norm": 3.3837392330169678
+  },
+  "cost_critic_validation": {
+    "mean_predicted_Vc_episode_collide": 0.30681341859549965,
+    "mean_predicted_Vc_episode_no_collision": 0.4196262627758615,
+    "episode_level_mse": 0.20884736418667516
+  },
+  "cost_signal_timing": {
+    "n_collided_episodes_checked": 3,
+    "cost_positive_count_values": [
+      1
+    ],
+    "fraction_collided_with_single_positive_cost": 1.0
+  },
+  "cost_return_numerics_train_partition": {
+    "gamma_cost_shared_with_gamma": 0.99,
+    "cost_returns_min": 0.19782771170139313,
+    "cost_returns_max": 1.0,
+    "cost_returns_mean": 0.4416738450527191,
+    "cost_values_min": 0.16326449811458588,
+    "cost_values_max": 0.7620478272438049,
+    "cost_values_mean": 0.4269421845092438,
+    "cost_adv_min": -0.30498504638671875,
+    "cost_adv_max": 0.7453930974006653,
+    "cost_adv_mean": 0.0147316325455904,
+    "frac_all_zero_cost_batches": 0.06666666666666667
+  },
+  "availability_notes": {
+    "approx_kl_logged": false,
+    "mean_cost_return_logged_per_iteration": false,
+    "checkpoint_lambda_persisted_per_ckpt": false
+  }
+}

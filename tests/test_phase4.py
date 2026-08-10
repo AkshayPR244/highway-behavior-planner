@@ -301,6 +301,104 @@ class TestGAEAdvantageMath:
         expected = 3.0 - 1.0   # = 2.0
         assert abs(buf.reward_advantages[0].item() - expected) < 1e-4
 
+    def test_reward_truncation_bootstraps_final_value(self):
+        buf = RolloutBuffer()
+        buf.add(
+            obs=np.zeros(OBS_DIM, dtype=np.float32),
+            action=0,
+            reward=1.0,
+            cost=0.0,
+            done=True,
+            terminated=False,
+            truncated=True,
+            value=2.0,
+            cost_value=0.2,
+            log_prob=-1.0,
+            next_reward_value=5.0,
+            next_cost_value=0.4,
+        )
+        buf.compute_returns(last_value=0.0, gamma=0.99, gae_lambda=0.0,
+                            device=torch.device("cpu"), last_cost_value=0.0)
+        assert abs(buf.reward_returns[0].item() - (1.0 + 0.99 * 5.0)) < 1e-4
+        assert abs(buf.reward_advantages[0].item() - (1.0 + 0.99 * 5.0 - 2.0)) < 1e-4
+
+    def test_cost_truncation_bootstraps_final_value(self):
+        buf = RolloutBuffer()
+        buf.add(
+            obs=np.zeros(OBS_DIM, dtype=np.float32),
+            action=0,
+            reward=0.0,
+            cost=0.0,
+            done=True,
+            terminated=False,
+            truncated=True,
+            value=0.0,
+            cost_value=0.2,
+            log_prob=-1.0,
+            next_reward_value=0.0,
+            next_cost_value=0.4,
+        )
+        buf.compute_returns(last_value=0.0, gamma=0.99, gae_lambda=0.0,
+                            device=torch.device("cpu"), last_cost_value=0.0)
+        assert abs(buf.cost_returns[0].item() - (0.0 + 0.99 * 0.4)) < 1e-4
+        assert abs(buf.cost_advantages[0].item() - (0.0 + 0.99 * 0.4 - 0.2)) < 1e-4
+
+    def test_terminal_step_no_truncation_bootstrap(self):
+        buf = RolloutBuffer()
+        buf.add(
+            obs=np.zeros(OBS_DIM, dtype=np.float32),
+            action=0,
+            reward=3.0,
+            cost=0.0,
+            done=True,
+            terminated=True,
+            truncated=False,
+            value=1.0,
+            cost_value=0.2,
+            log_prob=-1.0,
+            next_reward_value=5.0,
+            next_cost_value=0.4,
+        )
+        buf.compute_returns(last_value=0.0, gamma=0.99, gae_lambda=0.0,
+                            device=torch.device("cpu"), last_cost_value=0.0)
+        assert abs(buf.reward_returns[0].item() - 3.0) < 1e-4
+        assert abs(buf.cost_returns[0].item() - 0.0) < 1e-4
+
+    def test_truncation_does_not_cross_reset_boundary(self):
+        buf = RolloutBuffer()
+        buf.add(
+            obs=np.zeros(OBS_DIM, dtype=np.float32),
+            action=0,
+            reward=1.0,
+            cost=0.0,
+            done=True,
+            terminated=False,
+            truncated=True,
+            value=2.0,
+            cost_value=0.0,
+            log_prob=-1.0,
+            next_reward_value=5.0,
+            next_cost_value=0.0,
+        )
+        buf.add(
+            obs=np.ones(OBS_DIM, dtype=np.float32),
+            action=0,
+            reward=100.0,
+            cost=0.0,
+            done=False,
+            terminated=False,
+            truncated=False,
+            value=0.0,
+            cost_value=0.0,
+            log_prob=-1.0,
+            next_reward_value=0.0,
+            next_cost_value=0.0,
+        )
+        buf.compute_returns(last_value=0.0, gamma=0.99, gae_lambda=0.95,
+                            device=torch.device("cpu"), last_cost_value=0.0)
+        assert abs(buf.reward_returns[0].item() - (1.0 + 0.99 * 5.0)) < 1e-4
+        assert abs(buf.reward_advantages[0].item() - (1.0 + 0.99 * 5.0 - 2.0)) < 1e-4
+
 
 # ---------------------------------------------------------------------------
 # TestLagrangeUpdate
@@ -404,6 +502,53 @@ class TestLagrangeUpdate:
         assert captured["rewards"] == [1.0, 1.0]
         assert captured["costs"] == [0.0, 1.0]
         assert captured["lambda"] == pytest.approx(2.0)
+
+    def test_lambda_unchanged_when_no_episodes_complete(self, monkeypatch):
+        trainer = self._make_cmdp(eps=0.10, lr=0.1, lambda_init=0.7)
+
+        buf = RolloutBuffer()
+        buf.add(
+            obs=np.zeros(OBS_DIM, dtype=np.float32),
+            action=1,
+            reward=1.0,
+            cost=0.0,
+            done=False,
+            terminated=False,
+            truncated=False,
+            value=0.0,
+            cost_value=0.0,
+            log_prob=-0.5,
+            next_reward_value=0.0,
+            next_cost_value=0.0,
+        )
+        buf.compute_returns(last_value=0.0, gamma=trainer.ppo.cfg.gamma,
+                            gae_lambda=trainer.ppo.cfg.gae_lambda,
+                            device=trainer.ppo.device,
+                            last_cost_value=0.0)
+
+        def _fake_collect_rollout(_env):
+            stats = {
+                "episodes": 0,
+                "mean_ep_ret": 0.0,
+                "mean_ep_shaped": 0.0,
+                "collision_count": 0,
+            }
+            return buf, stats
+
+        captured = {}
+
+        def _fake_update(_buf, lagrange_lambda=0.0):
+            captured["lambda"] = lagrange_lambda
+            return {"pg_loss": 0.0, "reward_vf_loss": 0.0, "cost_vf_loss": 0.0, "ent_loss": 0.0}
+
+        monkeypatch.setattr(trainer.ppo, "collect_rollout", _fake_collect_rollout)
+        monkeypatch.setattr(trainer.ppo, "update", _fake_update)
+
+        history = trainer.train(env=None, n_iterations=1, verbose=False)
+        assert trainer.lambda_ == pytest.approx(0.7)
+        assert captured["lambda"] == pytest.approx(0.7)
+        assert history[-1]["lambda_updated"] is False
+        assert np.isnan(history[-1]["collision_rate"])
 
 
 # ---------------------------------------------------------------------------
